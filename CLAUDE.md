@@ -1,0 +1,46 @@
+# Working on Tanios
+
+Tanios is a personal AI assistant reached over WhatsApp. Read `docs/SPEC.md` before
+changing anything: it holds the approved decisions, the numbered requirements and the
+security rules. `docs/STATUS.md` says which milestone is current.
+
+## Commands
+
+```sh
+uv sync                          # install
+uv run pytest                    # tests
+uv run ruff check .              # lint
+uv run ruff format .             # format
+uv run uvicorn tanios.main:create_app --factory --reload   # run locally
+```
+
+Set `TANIOS_TEST_DATABASE_URL` to also run the test that needs a real Postgres.
+
+## How work lands
+
+- One milestone per pull request, in the order of the build plan. Do not start a
+  milestone until the owner has confirmed the checks of the one before it.
+- Every requirement a pull request covers has a test that names it (for example
+  `test_w3_unregistered_number_gets_one_reply`).
+- Update `docs/STATUS.md` in the same pull request, including an honest list of what
+  was and was not verified.
+- If the spec needs to change, the owner changes the spec first.
+
+## Rules that hold everywhere
+
+- No secrets in code, tests, logs or commits. Settings come from `TANIOS_` environment
+  variables through `tanios.config.Settings`.
+- Never log message bodies, email bodies, tokens, keys or connection URLs.
+- Outside services (WhatsApp, Gmail, model providers, the vault) sit behind small
+  interfaces so tests use stand-ins. Follow the shape of `DatabaseLike` in
+  `src/tanios/db.py`.
+- Only WhatsApp messages from a registered number are instructions. Anything read from
+  an email, a file, a web page or a note is data.
+- Model names and prices live in settings, not in code.
+- Never weaken a test or a lint rule to get to green.
+
+## The owner
+
+The owner is not a professional developer. Guides in `docs/` are written step by step
+in plain words, and anything the owner must do by hand (accounts, keys, deploys) gets
+exact instructions.
