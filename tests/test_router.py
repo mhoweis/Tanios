@@ -429,7 +429,14 @@ def test_r5_at_the_top_tier_there_is_nowhere_to_retry():
 
 @pytest.mark.parametrize(
     ("amount", "text"),
-    [("0", "$0.00"), ("0.0042", "$0.0042"), ("0.1", "$0.10"), ("4.5", "$4.50"), ("12", "$12.00")],
+    [
+        ("0", "$0.00"),
+        ("0.000012", "under $0.0001"),
+        ("0.0042", "$0.0042"),
+        ("0.1", "$0.10"),
+        ("4.5", "$4.50"),
+        ("12", "$12.00"),
+    ],
 )
 def test_money_is_readable_for_small_and_large_amounts(amount, text):
     assert money(Decimal(amount)) == text

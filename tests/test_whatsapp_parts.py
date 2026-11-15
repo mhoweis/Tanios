@@ -58,11 +58,18 @@ def test_parses_a_message_whose_phone_number_meta_left_out():
     assert message.sender_key == "JO.1"
 
 
-def test_a_voice_note_is_parsed_as_audio_with_no_text():
+def test_w2_a_voice_note_is_parsed_as_audio_with_its_media_id():
     [message] = parse_webhook(webhook_payload(kind="audio"))
 
     assert message.kind == "audio"
     assert message.text is None
+    assert message.media_id == "1908647269898587"
+
+
+def test_a_text_message_has_no_media_id():
+    [message] = parse_webhook(webhook_payload("Hi!"))
+
+    assert message.media_id is None
 
 
 @pytest.mark.parametrize(
@@ -145,6 +152,46 @@ def test_a_refused_send_raises_without_leaking_the_token_or_the_text():
     assert "401" in str(raised.value)
     assert "token-abc" not in str(raised.value)
     assert "private words" not in str(raised.value)
+
+
+def test_a_dropped_connection_gets_exactly_one_more_try():
+    attempts: list[int] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise httpx2.ReadError("connection reset")
+        return httpx2.Response(200, json={})
+
+    asyncio.run(whatsapp_client(handler).send_text(phone=OWNER, wa_user_id=None, body="Hello"))
+
+    assert len(attempts) == 2
+
+
+def test_a_connection_that_keeps_dropping_fails_after_the_second_try():
+    attempts: list[int] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        attempts.append(1)
+        raise httpx2.ReadError("connection reset")
+
+    with pytest.raises(WhatsAppSendError, match="ReadError"):
+        asyncio.run(whatsapp_client(handler).send_text(phone=OWNER, wa_user_id=None, body="Hi"))
+
+    assert len(attempts) == 2
+
+
+def test_a_timeout_is_not_retried_so_a_slow_send_is_not_doubled():
+    attempts: list[int] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        attempts.append(1)
+        raise httpx2.ReadTimeout("too slow")
+
+    with pytest.raises(WhatsAppSendError, match="ReadTimeout"):
+        asyncio.run(whatsapp_client(handler).send_text(phone=OWNER, wa_user_id=None, body="Hi"))
+
+    assert len(attempts) == 1
 
 
 def test_long_replies_are_split_into_parts_whatsapp_accepts():

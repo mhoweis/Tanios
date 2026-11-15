@@ -7,17 +7,17 @@ One line per milestone. Updated in the same pull request that changes it.
 | 0 Foundation | Built, waiting for the owner's check | Owner deploys with docs/DEPLOY.md and confirms `/healthz` and `/readyz` answer. |
 | 1 WhatsApp text | Built, waiting for the owner's check | Owner follows docs/SETUP-WHATSAPP.md and runs the six checks in part 5. |
 | 2 Router and budget | Built, waiting for the owner's check | Owner runs the checks at the end of docs/MODELS-AND-BUDGET.md. |
-| 3 Voice notes | Not started | |
+| 3 Voice notes | Built, waiting for the owner's check | Owner runs the checks in docs/VOICE-NOTES.md. |
 | 4 Obsidian memory | Not started | Needs Obsidian Sync and a new vault for Tanios. |
 | 5 Gmail | Not started | Needs a Google Cloud project with the Gmail API. |
 | 6 Files | Not started | |
 | 7 Testers | Not started | |
 
-Milestones 1 and 2 were built at the owner's request before the owner's server checks
-of the milestones before them. CI has built the Docker image and confirmed it answers
-`/healthz`, but as of milestone 2 nothing has run against the real Meta or OpenRouter
-services. The first live test covers three milestones at once, so expect to find
-things.
+Milestones 1, 2 and 3 were built at the owner's request before the owner's server
+checks of the milestones before them. CI has built the Docker image and confirmed it
+answers `/healthz`, but as of milestone 3 nothing has run against the real Meta or
+OpenRouter services. The first live test covers four milestones at once, so expect to
+find things.
 
 ## What has been verified, and how
 
@@ -89,6 +89,44 @@ How the requirements are met, and where they stop short:
 - All users share the server's model keys for now. Per-user keys arrive with the
   setup page in milestone 7, and matter once testers join.
 
+### Milestone 3
+
+Requirement covered: W2, except the "find the note" half of its check, which needs
+milestone 4.
+
+- 242 automated tests pass. The audio conversion tests run real ffmpeg on real audio:
+  an Ogg Opus voice note to 16 kHz mono WAV, and MP3 and raw PCM back to Ogg Opus.
+- Breaking any of these on purpose makes tests fail: the rule that the access token
+  only goes to Meta's hosts, the text copy for links and numbers, the cap on speech,
+  the voice-message flag, and the PCM input format.
+- The real server was run with stand-in servers for Meta and OpenRouter and a real
+  Ogg Opus recording. It downloaded the recording, sent valid WAV for transcription,
+  asked the chat model with the read-aloud wording, converted the returned MP3, and
+  uploaded a valid mono Ogg Opus file marked as a voice message. `status` showed all
+  three ledger lines. No secret, transcript or temporary file was left behind.
+- That run found one real weakness: after a failed upload the fallback text was lost
+  to a dropped connection. Message sends now retry once after a dropped connection
+  (not after a timeout).
+- Not yet verified: anything against the real services. In particular:
+  - that `openai/whisper-large-v3-turbo` accepts the WAV Tanios sends and reports cost
+    in `usage.cost`;
+  - that `openai/gpt-4o-mini-tts-2025-12-15` accepts the voice `alloy` through
+    OpenRouter and returns MP3;
+  - that WhatsApp shows the reply with the play button and waveform;
+  - the Docker image's own ffmpeg (CI checks that it has the Opus encoder).
+
+Where it stops short:
+
+- The cost of a voice reply is an estimate. The speech endpoint returns audio with no
+  cost, so Tanios multiplies the text length by `price_per_million_chars`, and that
+  price in the shipped models file is itself an estimate, not a published figure.
+- "Anything you need to copy also comes as text" is a simple rule: links, email
+  addresses, numbers of five digits or more, and answers of three lines or more.
+- One model per speech step. If it fails there is no second model to try: a failed
+  transcription gets an apology, and a failed voice reply falls back to text.
+- The voice is a stock voice set in the models file. A voice of the owner's own is a
+  phase 2 item.
+
 Checked against current documentation on 15 November 2026:
 
 - Meta sends the sender's phone number in `from` and a business-scoped user ID in
@@ -99,3 +137,8 @@ Checked against current documentation on 15 November 2026:
   month and charges beyond that. Every reply Tanios sends counts as one.
 - OpenRouter model IDs in `config/models.toml` (`openrouter/free` and the three
   `~anthropic/claude-*-latest` aliases) and their prices were read from openrouter.ai.
+- Meta's audio rules: a voice message must be Ogg with the Opus codec, mono, sent with
+  `"voice": true`, and 512 KB or smaller to show the play button. Incoming audio is
+  fetched by media ID, then from the address Meta returns, using the access token.
+- OpenRouter's audio endpoints: `/audio/transcriptions` takes base64 audio as JSON and
+  returns text with usage; `/audio/speech` returns MP3 or raw PCM bytes.

@@ -12,8 +12,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from tanios.catalog import ESCALATION, Catalog, ModelEntry
+from tanios.catalog import ESCALATION, Catalog, ModelEntry, SpeechEntry
 from tanios.llm import ModelError, ModelGateway, ModelReply
+from tanios.speech import SpeechGateway
 from tanios.store import Store, UsageEntry, UsageSummary, User
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,12 @@ class RoutedReply:
     notice: str | None = None
 
 
+@dataclass(frozen=True)
+class SpokenAudio:
+    data: bytes
+    format: str  # "mp3" or "pcm", as the speech model returned it
+
+
 class BudgetExceeded(Exception):
     """The monthly cap is reached and nothing free can do the job. The text is for the user."""
 
@@ -83,6 +90,8 @@ def money(amount: Decimal) -> str:
     """$1.50, $0.42, and four places for amounts under ten cents so they are not $0.00."""
     if amount == 0 or amount >= Decimal("0.10"):
         return f"${amount:.2f}"
+    if amount < Decimal("0.0001"):
+        return "under $0.0001"
     return f"${amount:.4f}"
 
 
@@ -94,9 +103,11 @@ class Router:
         gateway: ModelGateway,
         store: Store,
         *,
+        speech: SpeechGateway | None = None,
         max_tokens: int = 700,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
+        self._speech = speech
         self._catalog = catalog
         self._keys = {name.lower(): key for name, key in keys.items() if key}
         self._gateway = gateway
@@ -117,6 +128,12 @@ class Router:
             entry.provider in self._keys
             for tier in ESCALATION[start:]
             for entry in self._catalog.tiers.get(tier, ())
+        )
+
+    def voice_ready(self) -> bool:
+        """Can voice notes be understood at all with the keys that are set?"""
+        return self._speech is not None and any(
+            entry.provider in self._keys for entry in self._catalog.transcribers
         )
 
     async def month_usage(self, user: User) -> tuple[str, UsageSummary]:
@@ -171,6 +188,109 @@ class Router:
         notice = await self._budget_notice(user, task, spent_after, now)
         return RoutedReply(
             text=reply.text, model=reply.model, tier=choice.tier, retried=retried, notice=notice
+        )
+
+    # Speech (W2) ----------------------------------------------------------------------
+
+    async def transcribe(
+        self, *, user: User, audio: bytes, audio_format: str, seconds: float
+    ) -> str:
+        """A voice note as text. Raises BudgetExceeded over the cap, ModelError on failure."""
+        now = self._now()
+        entry = await self._pick_speech(self._catalog.transcribers, user, now)
+        try:
+            transcript = await self._speech.transcribe(
+                provider=self._catalog.providers[entry.provider],
+                api_key=self._keys[entry.provider],
+                model=entry.model,
+                audio=audio,
+                audio_format=audio_format,
+                language=entry.language,
+            )
+        except ModelError as error:
+            await self._record_speech(user, "transcribe", entry, Decimal(0), "error", now)
+            logger.warning("transcription failed: model=%s reason=%s", entry.model, error)
+            raise
+        cost = transcript.cost_usd
+        if cost is None:
+            cost = Decimal(str(seconds)) / 60 * (entry.price_per_minute or Decimal(0))
+        await self._record_speech(user, "transcribe", entry, cost, "ok", now)
+        return transcript.text
+
+    async def speak(self, *, user: User, text: str) -> SpokenAudio:
+        """An answer as audio. Raises BudgetExceeded over the cap, ModelError on failure."""
+        now = self._now()
+        entry = await self._pick_speech(self._catalog.speakers, user, now)
+        try:
+            data = await self._speech.speak(
+                provider=self._catalog.providers[entry.provider],
+                api_key=self._keys[entry.provider],
+                model=entry.model,
+                voice=entry.voice,
+                text=text,
+                audio_format=entry.format,
+            )
+        except ModelError as error:
+            await self._record_speech(user, "speak", entry, Decimal(0), "error", now)
+            logger.warning("speech failed: model=%s reason=%s", entry.model, error)
+            raise
+        # Speech endpoints return audio bytes with no cost attached, so this is an
+        # estimate from the listed price.
+        cost = len(text) * (entry.price_per_million_chars or Decimal(0)) / MILLION
+        await self._record_speech(user, "speak", entry, cost, "ok", now)
+        return SpokenAudio(data=data, format=entry.format)
+
+    async def _pick_speech(
+        self, entries: tuple[SpeechEntry, ...], user: User, now: datetime
+    ) -> SpeechEntry:
+        if self._speech is None:
+            raise NoModelAvailable("speech is not set up")
+        cap = user.monthly_cap_usd
+        over_cap = (
+            cap is not None and await self._store.spend_since(user.id, start_of_month(now)) >= cap
+        )
+        for entry in entries:
+            if entry.provider in self._keys and (entry.free or not over_cap):
+                return entry
+        if over_cap:
+            raise BudgetExceeded(
+                f"You have reached your monthly cap of {money(cap)}, so voice notes are off "
+                f"until {start_of_next_month(now).day} {start_of_next_month(now):%B}. "
+                "Text messages and commands still work."
+            )
+        raise NoModelAvailable("no speech model can be reached")
+
+    async def _record_speech(
+        self,
+        user: User,
+        task: str,
+        entry: SpeechEntry,
+        cost: Decimal,
+        outcome: str,
+        now: datetime,
+    ) -> None:
+        await self._store.record_usage(
+            UsageEntry(
+                user_id=user.id,
+                at=now,
+                task=task,
+                tier="speech",
+                provider=entry.provider,
+                model=entry.model,
+                cost_usd=cost,
+                prompt_tokens=0,
+                completion_tokens=0,
+                is_free=entry.free,
+                private=False,
+                outcome=outcome,
+            )
+        )
+        logger.info(
+            "model call: task=%s tier=speech model=%s cost_usd=%s outcome=%s",
+            task,
+            entry.model,
+            cost,
+            outcome,
         )
 
     # Choosing -------------------------------------------------------------------------

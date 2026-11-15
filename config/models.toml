@@ -59,7 +59,30 @@ model = "~anthropic/claude-opus-latest"
 input_price = 4.00
 output_price = 20.00
 
-# The speech tier is filled in when voice notes arrive (milestone 3).
+# --- Speech: voice notes in, voice notes out -------------------------------------------
+#
+# transcribe turns your voice note into text. speak turns the answer into a voice.
+# As with tiers, the first entry whose provider has a key is used.
+#
+# To change Tanios's voice, change the voice line. The voices a model offers are listed
+# on its page at openrouter.ai.
+#
+# The transcribe price was read from openrouter.ai on 15 November 2026 ($0.000003 a
+# second). The speak price is an estimate, not a published figure: check the Activity
+# page on openrouter.ai to see what voice replies really cost.
+
+[[speech.transcribe]]
+provider = "openrouter"
+model = "openai/whisper-large-v3-turbo"
+language = "en"
+price_per_minute = 0.00018
+
+[[speech.speak]]
+provider = "openrouter"
+model = "openai/gpt-4o-mini-tts-2025-12-15"
+voice = "alloy"
+format = "mp3"
+price_per_million_chars = 15.00
 
 # --- Tasks: which tier each kind of work starts on ------------------------------------
 

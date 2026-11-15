@@ -38,10 +38,29 @@ class ModelEntry:
 
 
 @dataclass(frozen=True)
+class SpeechEntry:
+    """A model that turns a voice note into text ("transcribe") or text into voice ("speak")."""
+
+    provider: str
+    model: str
+    free: bool = False
+    # transcribe: a language hint such as "en". Empty lets the model detect it.
+    language: str | None = None
+    # speak: the voice name, and the audio format to ask the provider for (mp3 or pcm).
+    voice: str | None = None
+    format: str = "mp3"
+    # Fallback prices in US dollars, used when the provider does not report cost.
+    price_per_minute: Decimal | None = None
+    price_per_million_chars: Decimal | None = None
+
+
+@dataclass(frozen=True)
 class Catalog:
     providers: dict[str, Provider]
     tiers: dict[str, tuple[ModelEntry, ...]]
     tasks: dict[str, str]
+    transcribers: tuple[SpeechEntry, ...] = ()
+    speakers: tuple[SpeechEntry, ...] = ()
 
     def tier_for(self, task_name: str) -> str:
         try:
@@ -91,7 +110,61 @@ def parse_catalog(data: dict) -> Catalog:
             raise CatalogError(f"task '{task}' points at unknown tier '{tier}'")
         tasks[task] = tier
 
-    return Catalog(providers=providers, tiers=tiers, tasks=tasks)
+    speech = _table(data, "speech")
+    for key in speech:
+        if key not in ("transcribe", "speak"):
+            raise CatalogError(f"[speech] has 'transcribe' and 'speak', not '{key}'")
+    return Catalog(
+        providers=providers,
+        tiers=tiers,
+        tasks=tasks,
+        transcribers=_speech_entries(speech, "transcribe", providers),
+        speakers=_speech_entries(speech, "speak", providers),
+    )
+
+
+def _speech_entries(
+    speech: dict, kind: str, providers: dict[str, Provider]
+) -> tuple[SpeechEntry, ...]:
+    entries = speech.get(kind, [])
+    if not isinstance(entries, list):
+        raise CatalogError(f"speech.{kind} must be written as [[speech.{kind}]] entries")
+    parsed = []
+    for raw in entries:
+        if not isinstance(raw, dict):
+            raise CatalogError(f"an entry in speech.{kind} is not a table")
+        provider = str(raw.get("provider", "")).lower()
+        model = raw.get("model")
+        if provider not in providers:
+            raise CatalogError(f"speech.{kind} uses provider '{provider}', which is not defined")
+        if not isinstance(model, str) or not model.strip():
+            raise CatalogError(f"an entry in speech.{kind} has no model")
+        free = raw.get("free", False)
+        if not isinstance(free, bool):
+            raise CatalogError(f"'free' for {model} must be true or false")
+        voice = raw.get("voice")
+        audio_format = raw.get("format", "mp3")
+        if kind == "speak":
+            if not isinstance(voice, str) or not voice.strip():
+                raise CatalogError(f"{model} under speech.speak needs a voice")
+            if audio_format not in ("mp3", "pcm"):
+                raise CatalogError(f"format for {model} must be mp3 or pcm")
+        language = raw.get("language")
+        if language is not None and not isinstance(language, str):
+            raise CatalogError(f'language for {model} must be text such as "en"')
+        parsed.append(
+            SpeechEntry(
+                provider=provider,
+                model=model.strip(),
+                free=free,
+                language=language or None,
+                voice=voice.strip() if isinstance(voice, str) else None,
+                format=audio_format,
+                price_per_minute=_price(raw, "price_per_minute", model),
+                price_per_million_chars=_price(raw, "price_per_million_chars", model),
+            )
+        )
+    return tuple(parsed)
 
 
 def _entry(tier: str, raw: object, providers: dict[str, Provider]) -> ModelEntry:

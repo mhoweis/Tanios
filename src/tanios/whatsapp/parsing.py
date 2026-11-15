@@ -19,6 +19,8 @@ class InboundMessage:
     wa_user_id: str | None
     # Which of our numbers it was sent to.
     phone_number_id: str | None
+    # For audio, image and other media messages: Meta's ID for the file.
+    media_id: str | None = None
 
     @property
     def sender_key(self) -> str:
@@ -63,6 +65,9 @@ def _parse_message(raw: dict, phone_number_id: Any) -> InboundMessage | None:
         body = raw.get("text", {}).get("body") if isinstance(raw.get("text"), dict) else None
         text = body if isinstance(body, str) else None
 
+    media = raw.get(kind) if kind != "text" and isinstance(raw.get(kind), dict) else {}
+    media_id = media.get("id")
+
     return InboundMessage(
         id=message_id,
         kind=kind,
@@ -70,6 +75,7 @@ def _parse_message(raw: dict, phone_number_id: Any) -> InboundMessage | None:
         phone=phone,
         wa_user_id=wa_user_id,
         phone_number_id=phone_number_id if isinstance(phone_number_id, str) else None,
+        media_id=media_id if isinstance(media_id, str) and media_id else None,
     )
 
 

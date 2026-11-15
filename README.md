@@ -9,10 +9,12 @@ model that can do each job.
 - How to put it on a server: [docs/DEPLOY.md](docs/DEPLOY.md)
 - How to connect WhatsApp and a model: [docs/SETUP-WHATSAPP.md](docs/SETUP-WHATSAPP.md)
 - Models and your monthly budget: [docs/MODELS-AND-BUDGET.md](docs/MODELS-AND-BUDGET.md)
+- Voice notes: [docs/VOICE-NOTES.md](docs/VOICE-NOTES.md)
 
 ## Run it on your own computer
 
-You need [uv](https://docs.astral.sh/uv/) and Python 3.12 or newer.
+You need [uv](https://docs.astral.sh/uv/), Python 3.12 or newer, and `ffmpeg` for
+voice notes.
 
 ```sh
 uv sync
