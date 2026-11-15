@@ -1,17 +1,16 @@
-"""Asking a language model for an answer.
+"""Talking to a model provider.
 
-Milestone 1 uses one model for everything. The router that picks the cheapest capable
-model per task, and the usage ledger, arrive in milestone 2; this interface already
-returns what they need (which model answered, and what it cost).
+This module only knows how to make one call. Which model to call, and whether the
+budget allows it, is decided by the router (tanios/router.py).
 """
 
-import logging
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
 import httpx2
 
-logger = logging.getLogger(__name__)
+from tanios.catalog import Provider
 
 
 class ModelError(Exception):
@@ -21,45 +20,57 @@ class ModelError(Exception):
 @dataclass(frozen=True)
 class ModelReply:
     text: str
-    model: str
-    cost_usd: float | None
+    model: str  # the model that actually answered, as the provider reports it
+    cost_usd: Decimal | None  # None when the provider does not report cost
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
-class ModelClient(Protocol):
+class ModelGateway(Protocol):
     """Tests use a stand-in with this shape (tests/fakes.py)."""
 
-    async def complete(self, *, system: str, user: str) -> ModelReply: ...
-
-
-class ChatCompletionsClient:
-    """Any provider that speaks the OpenAI chat-completions format. OpenRouter by default."""
-
-    def __init__(
+    async def call(
         self,
-        http: httpx2.AsyncClient,
         *,
+        provider: Provider,
         api_key: str,
-        api_base: str,
         model: str,
+        system: str,
+        user: str,
         max_tokens: int,
-    ) -> None:
-        self._http = http
-        self._url = f"{api_base.rstrip('/')}/chat/completions"
-        self._headers = {"Authorization": f"Bearer {api_key}"}
-        self._model = model
-        self._max_tokens = max_tokens
+    ) -> ModelReply: ...
 
-    async def complete(self, *, system: str, user: str) -> ModelReply:
+
+class ChatCompletionsGateway:
+    """Any provider that speaks the OpenAI chat-completions format."""
+
+    def __init__(self, http: httpx2.AsyncClient) -> None:
+        self._http = http
+
+    async def call(
+        self,
+        *,
+        provider: Provider,
+        api_key: str,
+        model: str,
+        system: str,
+        user: str,
+        max_tokens: int,
+    ) -> ModelReply:
         payload = {
-            "model": self._model,
-            "max_tokens": self._max_tokens,
+            "model": model,
+            "max_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
         }
         try:
-            response = await self._http.post(self._url, json=payload, headers=self._headers)
+            response = await self._http.post(
+                f"{provider.api_base}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
         except httpx2.HTTPError as error:
             raise ModelError(type(error).__name__) from None
         if response.status_code >= 400:
@@ -70,15 +81,28 @@ class ChatCompletionsClient:
             text = data["choices"][0]["message"]["content"]
         except (ValueError, KeyError, IndexError, TypeError):
             raise ModelError("unreadable response") from None
-        if not isinstance(text, str) or not text.strip():
-            raise ModelError("empty answer")
+        if not isinstance(text, str):
+            raise ModelError("unreadable response")
 
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-        cost = usage.get("cost")
-        reply = ModelReply(
+        return ModelReply(
             text=text.strip(),
-            model=str(data.get("model") or self._model),
-            cost_usd=float(cost) if isinstance(cost, int | float) else None,
+            model=str(data.get("model") or model),
+            cost_usd=_cost(usage.get("cost")),
+            prompt_tokens=_count(usage.get("prompt_tokens")),
+            completion_tokens=_count(usage.get("completion_tokens")),
         )
-        logger.info("model call: model=%s cost_usd=%s", reply.model, reply.cost_usd)
-        return reply
+
+
+def _cost(value: object) -> Decimal | None:
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        return None
+    try:
+        cost = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    return cost if cost.is_finite() and cost >= 0 else None
+
+
+def _count(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0

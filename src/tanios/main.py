@@ -16,9 +16,11 @@ from fastapi.responses import PlainTextResponse
 
 from tanios import __version__
 from tanios.assistant import Assistant
+from tanios.catalog import CatalogError, load_catalog, resolve_path
 from tanios.config import Settings, get_settings
 from tanios.db import Database, DatabaseLike
-from tanios.llm import ChatCompletionsClient
+from tanios.llm import ChatCompletionsGateway
+from tanios.router import CHAT, Router
 from tanios.store import SqlStore
 from tanios.whatsapp.client import CloudApiClient
 from tanios.whatsapp.parsing import InboundMessage, parse_webhook
@@ -55,7 +57,11 @@ def create_app(
         missing = settings.missing_for_messaging()
         if handler is None and isinstance(db, Database) and not missing:
             http = httpx2.AsyncClient(timeout=httpx2.Timeout(60.0, connect=10.0))
-            app.state.handler = await _build_assistant(settings, db, http)
+            try:
+                app.state.handler = await _build_assistant(settings, db, http)
+            except CatalogError as error:
+                # The server stays up so /healthz works and the log can be read.
+                logger.error("WhatsApp chat is off. The models file needs fixing: %s", error)
         elif handler is None:
             # Names only, never values.
             logger.warning("WhatsApp chat is off. Still to set: %s", ", ".join(missing))
@@ -148,8 +154,23 @@ def create_app(
 async def _build_assistant(
     settings: Settings, database: Database, http: httpx2.AsyncClient
 ) -> Assistant:
+    catalog = load_catalog(resolve_path(settings.models_file))
     store = SqlStore(database.sessions)
-    await store.ensure_owner(settings.owner_number)
+    router = Router(
+        catalog,
+        settings.provider_keys(),
+        ChatCompletionsGateway(http),
+        store,
+        max_tokens=settings.max_reply_tokens,
+    )
+    if not router.can_answer(CHAT):
+        raise CatalogError("no model for the chat task can be reached with the keys that are set")
+
+    await store.ensure_owner(
+        settings.owner_number,
+        monthly_cap_usd=settings.monthly_cap_usd,
+        allow_free_for_private=settings.allow_free_for_private,
+    )
     whatsapp = CloudApiClient(
         http,
         access_token=settings.whatsapp_access_token.get_secret_value(),
@@ -157,11 +178,4 @@ async def _build_assistant(
         api_base=settings.whatsapp_api_base,
         graph_version=settings.whatsapp_graph_version,
     )
-    model = ChatCompletionsClient(
-        http,
-        api_key=settings.openrouter_api_key.get_secret_value(),
-        api_base=settings.model_api_base,
-        model=settings.default_model,
-        max_tokens=settings.max_reply_tokens,
-    )
-    return Assistant(store, whatsapp, model, ack_after_seconds=settings.ack_after_seconds)
+    return Assistant(store, whatsapp, router, ack_after_seconds=settings.ack_after_seconds)

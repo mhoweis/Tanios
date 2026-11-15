@@ -2,11 +2,13 @@
 
 import asyncio
 import json
+from decimal import Decimal
 
 import httpx2
 import pytest
 
-from tanios.llm import ChatCompletionsClient, ModelError
+from tanios.catalog import Provider
+from tanios.llm import ChatCompletionsGateway, ModelError
 from tanios.whatsapp.client import CloudApiClient, WhatsAppSendError, split_text
 from tanios.whatsapp.parsing import parse_webhook
 from tanios.whatsapp.signature import is_valid_signature, sign
@@ -161,20 +163,26 @@ def test_a_short_reply_is_one_part():
     assert split_text("Hello") == ["Hello"]
 
 
-# Asking the model ---------------------------------------------------------------------
+# Asking a model ------------------------------------------------------------------------
+
+PROVIDER = Provider(name="openrouter", api_base="https://models.example/api/v1")
 
 
-def model_client(handler) -> ChatCompletionsClient:
-    return ChatCompletionsClient(
-        httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
-        api_key="sk-or-test",
-        api_base="https://models.example/api/v1",
-        model="vendor/small-model",
-        max_tokens=700,
+def ask(handler, *, user: str = "Capital?"):
+    gateway = ChatCompletionsGateway(httpx2.AsyncClient(transport=httpx2.MockTransport(handler)))
+    return asyncio.run(
+        gateway.call(
+            provider=PROVIDER,
+            api_key="sk-or-test",
+            model="vendor/small-model",
+            system="Be brief.",
+            user=user,
+            max_tokens=700,
+        )
     )
 
 
-def test_complete_posts_a_chat_completions_request_and_reads_the_answer_and_cost():
+def test_the_gateway_posts_a_chat_completions_request_and_reads_answer_cost_and_tokens():
     requests: list[httpx2.Request] = []
 
     def handler(request: httpx2.Request) -> httpx2.Response:
@@ -182,13 +190,13 @@ def test_complete_posts_a_chat_completions_request_and_reads_the_answer_and_cost
         return httpx2.Response(
             200,
             json={
-                "model": "vendor/small-model",
+                "model": "vendor/small-model-20261101",
                 "choices": [{"message": {"role": "assistant", "content": " Paris. "}}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00014},
             },
         )
 
-    reply = asyncio.run(model_client(handler).complete(system="Be brief.", user="Capital?"))
+    reply = ask(handler)
 
     [request] = requests
     assert str(request.url) == "https://models.example/api/v1/chat/completions"
@@ -202,8 +210,29 @@ def test_complete_posts_a_chat_completions_request_and_reads_the_answer_and_cost
         ],
     }
     assert reply.text == "Paris."
-    assert reply.model == "vendor/small-model"
-    assert reply.cost_usd == 0.00014
+    assert reply.model == "vendor/small-model-20261101"
+    assert reply.cost_usd == Decimal("0.00014")
+    assert (reply.prompt_tokens, reply.completion_tokens) == (10, 2)
+
+
+def test_a_provider_that_reports_no_cost_yields_none_not_zero():
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "Paris."}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+            },
+        )
+
+    assert ask(handler).cost_usd is None
+
+
+def test_an_empty_answer_is_returned_for_the_router_to_judge():
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json={"choices": [{"message": {"content": "   "}}]})
+
+    assert ask(handler).text == ""
 
 
 @pytest.mark.parametrize(
@@ -213,35 +242,20 @@ def test_complete_posts_a_chat_completions_request_and_reads_the_answer_and_cost
         httpx2.Response(402, json={"error": {"message": "no credits"}}),
         httpx2.Response(200, text="not json"),
         httpx2.Response(200, json={"choices": []}),
-        httpx2.Response(200, json={"choices": [{"message": {"content": "   "}}]}),
+        httpx2.Response(200, json={"choices": [{"message": {"content": None}}]}),
     ],
 )
 def test_every_kind_of_bad_model_response_becomes_a_model_error(response):
     with pytest.raises(ModelError):
-        asyncio.run(model_client(lambda request: response).complete(system="s", user="u"))
+        ask(lambda request: response)
 
 
-def test_a_network_failure_becomes_a_model_error_without_the_key():
+def test_a_network_failure_becomes_a_model_error_without_the_key_or_the_question():
     def handler(request: httpx2.Request) -> httpx2.Response:
         raise httpx2.ConnectError("could not reach https://models.example with sk-or-test")
 
     with pytest.raises(ModelError) as raised:
-        asyncio.run(model_client(handler).complete(system="s", user="private question"))
+        ask(handler, user="private question")
 
     assert "sk-or-test" not in str(raised.value)
     assert "private question" not in str(raised.value)
-
-
-def test_the_model_call_log_has_model_and_cost_but_no_text(caplog):
-    def handler(request: httpx2.Request) -> httpx2.Response:
-        return httpx2.Response(
-            200,
-            json={"choices": [{"message": {"content": "secret answer"}}], "usage": {"cost": 0.5}},
-        )
-
-    with caplog.at_level("INFO"):
-        asyncio.run(model_client(handler).complete(system="s", user="secret question"))
-
-    assert "vendor/small-model" in caplog.text
-    assert "0.5" in caplog.text
-    assert "secret" not in caplog.text

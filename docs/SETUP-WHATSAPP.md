@@ -5,7 +5,7 @@ After this guide you can text Tanios on WhatsApp and get an answer. Allow about 
 Do [DEPLOY.md](DEPLOY.md) first. Meta will only talk to a public `https://` address, so
 `https://YOUR_DOMAIN/healthz` has to work before you start here.
 
-You will collect seven values and put them in the `.env` file on the server. Keep a
+You will collect six values and choose a monthly cap, and put them in the `.env` file on the server. Keep a
 note open and paste each one as you get it. They are secrets: do not share them, and
 never paste them into a chat with Claude.
 
@@ -21,9 +21,8 @@ https://developers.facebook.com/documentation/business-messaging/whatsapp/get-st
    offers a credit limit, set a small one, for example 5 dollars.
 4. Copy the key. It starts with `sk-or-`. This is `TANIOS_OPENROUTER_API_KEY`.
 
-The model that answers is named in `TANIOS_DEFAULT_MODEL`. The `.env.example` file
-suggests a small, cheap one. You can replace it with any model ID from
-https://openrouter.ai/models at any time.
+Which models Tanios uses, and how to set a monthly spending cap, is covered in
+[MODELS-AND-BUDGET.md](MODELS-AND-BUDGET.md). The defaults work without any changes.
 
 ## Part 2: a WhatsApp number from Meta
 
@@ -86,7 +85,7 @@ If `.env` has no WhatsApp lines yet, copy them from `.env.example`. Fill in:
 | `TANIOS_WHATSAPP_PHONE_NUMBER_ID` | from step 2.2 |
 | `TANIOS_OWNER_NUMBER` | your own WhatsApp number with country code, digits only |
 | `TANIOS_OPENROUTER_API_KEY` | from part 1 |
-| `TANIOS_DEFAULT_MODEL` | leave the suggested value, or choose your own |
+| `TANIOS_MONTHLY_CAP_USD` | the most to spend on models each month, in dollars; `5` is a sensible start |
 
 Save with Ctrl+O, Enter, then exit with Ctrl+X. Restart:
 
@@ -115,17 +114,18 @@ From your own phone, message the test number.
 | --- | --- | --- |
 | W1 | Send `what can you do?` | A real answer within a few seconds. |
 | W4 | Send `help` | The list of commands. |
-| W4 | Send `status` | `Tanios is active.` |
+| W4 | Send `status` | A reply that starts `Tanios is active.` |
 | W4 | Send `pause`, then any question | It says it is paused and does not answer the question. |
 | W4 | Send `resume`, then the question again | It answers. |
 | W3 | From a different phone that you also added in step 2.2, send `hello` twice | One line saying this is a private assistant, then nothing. |
 
-When all six pass, milestone 1 is done. Tell Claude, and milestone 2 starts.
+When all six pass, milestone 1 is done. The checks for milestone 2 are at the end of
+[MODELS-AND-BUDGET.md](MODELS-AND-BUDGET.md).
 
 ## What this costs
 
 - **OpenRouter:** each answer costs a fraction of a cent on a small model, taken from
-  your credits.
+  your credits. Your monthly cap limits the total.
 - **Meta:** since 1 October 2026 each business number gets 1,000 free replies a month,
   and replies beyond that are charged
   ([Meta's pricing page](https://developers.facebook.com/documentation/business-messaging/whatsapp/pricing)).
@@ -140,13 +140,12 @@ When all six pass, milestone 1 is done. Tell Claude, and milestone 2 starts.
 | Your own number gets the "private assistant" line | `TANIOS_OWNER_NUMBER` does not match your number. Use digits only, with country code, no `+` or spaces needed. If you use a WhatsApp username with your number hidden, Meta does not send Tanios your number on first contact; turn that off for the first message. |
 | The log says `sending a WhatsApp message failed: HTTP 401` | The access token is wrong or expired. Repeat step 2.4. |
 | The log says `model call failed: HTTP 401` or `402` | The OpenRouter key is wrong, or the credits have run out. |
-| Tanios answers `Sorry, I could not get an answer just now` | The model ID in `TANIOS_DEFAULT_MODEL` may not exist any more. Pick another on openrouter.ai/models. |
+| Tanios answers `Sorry, I could not get an answer just now` | A model in the models file may not exist any more. See "Change a model" in [MODELS-AND-BUDGET.md](MODELS-AND-BUDGET.md). |
 
 ## Known limits in this milestone
 
 - Tanios does not remember earlier messages yet. Each question is answered alone.
   Memory arrives in milestone 4.
-- `status` does not show spend yet. That arrives with the budget in milestone 2.
 - Voice notes get a short "text only for now" reply until milestone 3.
 - Meta's test number is for trying things out. Moving to a number of your own is a
   later step and comes with its own guide.

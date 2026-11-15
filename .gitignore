@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# The owner's own model choices (see config/models.toml)
+config/models.local.toml
+
 # Python
 __pycache__/
 *.py[cod]

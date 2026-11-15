@@ -5,14 +5,17 @@ from the environment (see docker-compose.yml); on a developer machine they may c
 from a local .env file, which git ignores.
 """
 
+from decimal import Decimal
 from functools import lru_cache
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="TANIOS_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="TANIOS_", env_file=".env", extra="ignore", env_nested_delimiter="__"
+    )
 
     env: str = "development"
     log_level: str = "INFO"
@@ -31,12 +34,20 @@ class Settings(BaseSettings):
     # The owner's own WhatsApp number, digits only with country code. Registered at start.
     owner_number: str | None = None
 
-    # The model provider. Any address that speaks the OpenAI chat-completions format works.
+    # Model keys. OpenRouter's has its own setting; a provider named "example" in the
+    # models file reads its key from TANIOS_KEYS__EXAMPLE.
     openrouter_api_key: SecretStr | None = None
-    model_api_base: str = "https://openrouter.ai/api/v1"
-    # Model names change often, so there is no default in code. See .env.example.
-    default_model: str | None = None
+    keys: dict[str, SecretStr] = {}
+    # Where the model catalog is. Empty means config/models.local.toml when it exists,
+    # otherwise config/models.toml.
+    models_file: str | None = None
     max_reply_tokens: int = 700
+
+    # The owner's budget, in US dollars per calendar month. Empty means no cap. From
+    # milestone 7 each user sets their own on the setup page.
+    monthly_cap_usd: Decimal | None = Field(default=None, ge=0)
+    # R3: may free models see the owner's email, notes and files?
+    allow_free_for_private: bool = False
 
     # W1: say "working on it" when an answer takes longer than this. Must stay under 10.
     ack_after_seconds: float = 8.0
@@ -58,10 +69,20 @@ class Settings(BaseSettings):
             "TANIOS_WHATSAPP_ACCESS_TOKEN": self.whatsapp_access_token,
             "TANIOS_WHATSAPP_PHONE_NUMBER_ID": self.whatsapp_phone_number_id,
             "TANIOS_OWNER_NUMBER": self.owner_number,
-            "TANIOS_OPENROUTER_API_KEY": self.openrouter_api_key,
-            "TANIOS_DEFAULT_MODEL": self.default_model,
+            "TANIOS_OPENROUTER_API_KEY": self.provider_keys(),
         }
         return [name for name, value in required.items() if not value]
+
+    def provider_keys(self) -> dict[str, str]:
+        """Provider name to key, for every key that is set. Never log the result."""
+        keys = {
+            name.lower(): secret.get_secret_value()
+            for name, secret in self.keys.items()
+            if secret.get_secret_value().strip()
+        }
+        if self.openrouter_api_key:
+            keys["openrouter"] = self.openrouter_api_key.get_secret_value()
+        return keys
 
 
 @lru_cache
