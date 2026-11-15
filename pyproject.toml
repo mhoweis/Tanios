@@ -5,8 +5,10 @@ description = "Tanios: a personal AI assistant reached over WhatsApp"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.20.1",
     "asyncpg>=0.29",
     "fastapi>=0.115",
+    "httpx2>=2.16.0",
     "pydantic-settings>=2.4",
     "sqlalchemy[asyncio]>=2.0.30",
     "uvicorn[standard]>=0.30",
@@ -14,7 +16,6 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "httpx2>=2.16.0",
     "pytest>=8",
     "ruff>=0.6",
 ]
@@ -28,6 +29,7 @@ packages = ["src/tanios"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100

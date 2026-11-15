@@ -5,6 +5,8 @@ services:
   app:
     build: .
     restart: unless-stopped
+    # Every TANIOS_ setting in .env reaches the app. The two below are fixed here.
+    env_file: .env
     environment:
       TANIOS_ENV: production
       TANIOS_DATABASE_URL: postgresql+asyncpg://tanios:${POSTGRES_PASSWORD}@db:5432/tanios
