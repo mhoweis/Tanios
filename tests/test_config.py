@@ -1,3 +1,5 @@
+import pytest
+
 from tanios.config import Settings
 
 
@@ -105,3 +107,44 @@ def test_r3_free_models_for_private_content_are_off_unless_switched_on(monkeypat
 
     monkeypatch.setenv("TANIOS_ALLOW_FREE_FOR_PRIVATE", "true")
     assert Settings(_env_file=None).allow_free_for_private is True
+
+
+def test_m1_memory_settings_default_to_off_and_utc(monkeypatch):
+    monkeypatch.delenv("TANIOS_VAULTS_DIR", raising=False)
+    monkeypatch.delenv("TANIOS_TIMEZONE", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.vaults_dir is None
+    assert settings.timezone == "UTC"
+
+
+def test_m1_the_vaults_folder_and_time_zone_come_from_the_environment(monkeypatch):
+    monkeypatch.setenv("TANIOS_VAULTS_DIR", "/vaults")
+    monkeypatch.setenv("TANIOS_TIMEZONE", "Asia/Amman")
+
+    settings = Settings(_env_file=None)
+
+    assert str(settings.vaults_dir) == "/vaults"
+    assert settings.timezone == "Asia/Amman"
+
+
+def test_a_time_zone_that_does_not_exist_is_refused_with_a_plain_message(monkeypatch):
+    monkeypatch.setenv("TANIOS_TIMEZONE", "Amman")
+
+    with pytest.raises(ValueError, match="TANIOS_TIMEZONE must be a time zone name"):
+        Settings(_env_file=None)
+
+
+def test_a_blank_line_for_a_setting_with_a_default_keeps_the_default(monkeypatch):
+    monkeypatch.setenv("TANIOS_TIMEZONE", "")
+    monkeypatch.setenv("TANIOS_LOG_LEVEL", " ")
+    monkeypatch.setenv("TANIOS_VAULTS_DIR", "")
+    monkeypatch.setenv("TANIOS_MONTHLY_CAP_USD", "")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.timezone == "UTC"
+    assert settings.log_level == "INFO"
+    assert settings.vaults_dir is None
+    assert settings.monthly_cap_usd is None

@@ -3,12 +3,14 @@
 Run with: uvicorn tanios.main:create_app --factory
 """
 
+import asyncio
 import hmac
 import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 import httpx2
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response, status
@@ -21,9 +23,11 @@ from tanios.catalog import CatalogError, load_catalog, resolve_path
 from tanios.config import Settings, get_settings
 from tanios.db import Database, DatabaseLike
 from tanios.llm import ChatCompletionsGateway
+from tanios.memory import Memories
 from tanios.router import CHAT, Router
 from tanios.speech import AudioApiGateway
 from tanios.store import SqlStore
+from tanios.vault import VaultError
 from tanios.whatsapp.client import CloudApiClient
 from tanios.whatsapp.parsing import InboundMessage, parse_webhook
 from tanios.whatsapp.signature import is_valid_signature
@@ -188,5 +192,24 @@ async def _build_assistant(
         whatsapp,
         router,
         audio=FfmpegConverter(),
+        memories=await _open_memories(settings, store),
         ack_after_seconds=settings.ack_after_seconds,
     )
+
+
+async def _open_memories(settings: Settings, store: SqlStore) -> Memories | None:
+    """Memory is on when a vaults folder is set. The owner's vault is laid out at start (M1)."""
+    if settings.vaults_dir is None:
+        logger.warning("memory is off. Still to set: TANIOS_VAULTS_DIR")
+        return None
+    memories = Memories(settings.vaults_dir, ZoneInfo(settings.timezone))
+    owner = await store.find_user(settings.owner_number, None)
+    if owner is not None:
+        try:
+            await asyncio.to_thread(memories(owner.id).ensure_layout)
+        except VaultError as error:
+            # Memory stays on: each request that needs the vault reports the problem.
+            logger.error("the owner's vault could not be prepared: %s", error)
+            return memories
+        logger.info("memory is on: the owner's vault is the folder user-%s", owner.id)
+    return memories

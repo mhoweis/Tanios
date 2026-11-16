@@ -8,16 +8,16 @@ One line per milestone. Updated in the same pull request that changes it.
 | 1 WhatsApp text | Built, waiting for the owner's check | Owner follows docs/SETUP-WHATSAPP.md and runs the six checks in part 5. |
 | 2 Router and budget | Built, waiting for the owner's check | Owner runs the checks at the end of docs/MODELS-AND-BUDGET.md. |
 | 3 Voice notes | Built, waiting for the owner's check | Owner runs the checks in docs/VOICE-NOTES.md. |
-| 4 Obsidian memory | Not started | Needs Obsidian Sync and a new vault for Tanios. |
+| 4 Obsidian memory | Built, waiting for the owner's check | Owner follows docs/MEMORY.md and runs its eight checks. Sync with Obsidian has never run. |
 | 5 Gmail | Not started | Needs a Google Cloud project with the Gmail API. |
 | 6 Files | Not started | |
 | 7 Testers | Not started | |
 
-Milestones 1, 2 and 3 were built at the owner's request before the owner's server
-checks of the milestones before them. CI has built the Docker image and confirmed it
-answers `/healthz`, but as of milestone 3 nothing has run against the real Meta or
-OpenRouter services. The first live test covers four milestones at once, so expect to
-find things.
+Milestones 1 to 4 were built at the owner's request before the owner's server checks
+of the milestones before them. CI has built the Docker images and confirmed the app
+answers `/healthz`, but as of milestone 4 nothing has run against the real Meta,
+OpenRouter or Obsidian services. The first live test covers five milestones at once,
+so expect to find things.
 
 ## What has been verified, and how
 
@@ -126,6 +126,72 @@ Where it stops short:
   transcription gets an apology, and a failed voice reply falls back to text.
 - The voice is a stock voice set in the models file. A voice of the owner's own is a
   phase 2 item.
+
+### Milestone 4
+
+Requirements covered: M1 to M5, M7, M8, and the "find the note" half of W2.
+
+- 368 automated tests pass. The vault and memory tests use a real folder on disk.
+- Breaking any of these on purpose makes tests fail: the check that a path stays inside
+  the vault, the rule against following links out of it, the rule against hidden files,
+  marking a call that carries notes as private, dropping note titles the model made up,
+  the pause rule for saving, the retry when an answer does not name its notes, the
+  wrapping that stops a note from posing as something else, deleting only when one
+  memory matches, keeping `forget` inside `Memory/`, and the log lines.
+- The real server was run against Postgres with stand-in servers for Meta and the model
+  provider and a real vault folder. The vault was laid out at start; `remember`, `note:`
+  and a spoken "make a note to ..." each wrote the right note; a question was answered
+  with the note in the prompt and named it in the reply; an edit to `Instructions`
+  reached the model on the next message; a stranger's `forget` did nothing; the owner's
+  `forget` deleted the note and the next answer no longer had it; the log listed the
+  four actions. No note text or secret appeared in the server log.
+- Not yet verified:
+  - **Obsidian Sync end to end.** The commands in docs/MEMORY.md were read from the
+    help text of Obsidian Headless 0.0.14, but none was run against a real account.
+    Signing in, creating the vault, the first sync and the notes reaching a phone are
+    all untested. Obsidian Headless is in open beta.
+  - That the app and the sync tool, writing the same folder at the same time, do not
+    trip over each other. Tanios writes each note in one step to lower the risk.
+  - That the real models end their answer with the `NOTES:` line reliably. If the small
+    model forgets, the one retry goes to the medium tier, which costs more.
+  - The `vault-sync` Docker image and the shared `/vaults` volume, other than in CI.
+
+How the requirements are met, and where they stop short:
+
+- **M1.** One folder per user, `user-<id>`, under `/vaults`. All file access goes
+  through one module that refuses paths outside that folder. Only the owner's vault is
+  synced; vaults for testers come with milestone 7.
+- **M2 and M3.** A message is saved when it starts with `remember` or `note` (after an
+  optional "Tanios, please"). No model decides this. A sentence with the wish in the
+  middle ("could you jot down that ...") is answered as a question instead, and the
+  model tells the user which word to start with.
+- **M4.** Notes are found by matching words, with no index and no model: up to four
+  notes and about 4,000 characters per question. A question worded very differently
+  from the note will miss it. The reply names only notes that were offered and that the
+  model said it used.
+- **M5.** The Instructions note is added to the system prompt on every message, up to
+  4,000 characters. An edit made in Obsidian applies once Sync has delivered it.
+- **M7.** `forget` deletes notes in `Memory/` only, and only when exactly one matches.
+  It does not remove Inbox notes, and Obsidian Sync keeps its own version history of a
+  deleted note for a while.
+- **M8.** Saves and forgets are logged. Answers are not, as they change nothing.
+- **R3.** A call that carries notes or Instructions is private, so it never goes to a
+  free model unless the switch is on. Over the cap, a free model answers without them
+  and says so.
+- A user who writes Instructions has every chat call marked private, so their chats
+  never use a free model while under the cap. That was already true: chat starts on the
+  small tier.
+- There is still no conversation history: each question stands on its own.
+- A blank line for a setting that has a default (for example `TANIOS_LOG_LEVEL=`) now
+  means the default. Before this milestone it stopped the server from starting.
+
+Checked against current documentation on 16 November 2026:
+
+- Obsidian Headless (`obsidian-headless` 0.0.14 on npm, from Obsidian's own
+  repository) needs Node.js 22 and an Obsidian Sync subscription. Its commands
+  `ob login`, `ob sync-create-remote`, `ob sync-setup` and `ob sync --continuous` and
+  their options were read from the installed tool's help.
+- Obsidian's help page for connecting a phone to an existing remote vault.
 
 Checked against current documentation on 15 November 2026:
 

@@ -22,7 +22,11 @@ COPY src ./src
 COPY config ./config
 RUN uv sync --frozen --no-dev --no-editable
 
-RUN useradd --system --no-create-home tanios
+# The vault-sync container (docker/vault-sync) runs as the same user number, so both can
+# read and write the notes in /vaults.
+RUN useradd --system --uid 10001 --no-create-home tanios \
+    && mkdir /vaults \
+    && chown tanios /vaults
 USER tanios
 
 EXPOSE 8000

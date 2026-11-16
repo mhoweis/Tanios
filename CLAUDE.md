@@ -46,6 +46,10 @@ The server applies migrations at start with `python -m tanios.migrate`.
 - Every model call goes through `tanios.router.Router.complete`. Nothing else may call a
   model. A task that handles email, vault or file content is created with
   `Task(name, private=True)`. Speech goes through `Router.transcribe` and `Router.speak`.
+- Vault files are touched only through `tanios.vault.FolderVault`, which keeps every
+  path inside one user's vault folder. Saving, finding and forgetting live in
+  `tanios.memory` and use no model. A path is never built from text a user or a model
+  wrote without going through `note_title`.
 - Never weaken a test or a lint rule to get to green.
 
 ## The owner
