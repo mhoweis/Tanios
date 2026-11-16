@@ -4,7 +4,9 @@ Run with: uvicorn tanios.main:create_app --factory
 """
 
 import asyncio
+import contextlib
 import hmac
+import html
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -14,15 +16,20 @@ from zoneinfo import ZoneInfo
 
 import httpx2
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response, status
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 
 from tanios import __version__
 from tanios.assistant import Assistant
 from tanios.audio import FfmpegConverter
 from tanios.catalog import CatalogError, load_catalog, resolve_path
 from tanios.config import Settings, get_settings
+from tanios.crypto import SealError, TokenBox
 from tanios.db import Database, DatabaseLike
+from tanios.gmail.client import GmailApi
+from tanios.gmail.oauth import GoogleOAuth
 from tanios.llm import ChatCompletionsGateway
+from tanios.mail import DRAFT, LABEL, Mailroom
+from tanios.mailstore import SqlMailStore
 from tanios.memory import Memories
 from tanios.router import CHAT, Router
 from tanios.speech import AudioApiGateway
@@ -35,14 +42,60 @@ from tanios.whatsapp.signature import is_valid_signature
 logger = logging.getLogger(__name__)
 
 
+MAIL_TICK_SECONDS = 60
+
+PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tanios</title>
+<style>body {{ font-family: system-ui, sans-serif; max-width: 30rem; margin: 3rem auto;
+padding: 0 1rem }} h1 {{ font-size: 1.3rem }}</style></head>
+<body><h1>{title}</h1><p>{text}</p></body></html>"""
+
+
+def page(title: str, text: str, status_code: int = 200) -> HTMLResponse:
+    body = PAGE.format(title=html.escape(title), text=html.escape(text))
+    # Sign-in pages carry one-time values in their address: keep them out of caches and
+    # out of the Referer header of anything the browser opens next.
+    headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+    return HTMLResponse(body, status_code=status_code, headers=headers)
+
+
 class MessageHandler(Protocol):
     async def handle(self, message: InboundMessage) -> None: ...
+
+
+class MailDesk(Protocol):
+    """The part of the mailroom the web pages and the clock use."""
+
+    async def consent_url(self, token: str) -> str | None: ...
+
+    async def finish_connection(self, state: str, code: str) -> str | None: ...
+
+    async def run_due(self) -> None: ...
+
+
+class NoQueryStrings(logging.Filter):
+    """Keeps what follows "?" in a web address out of the access log.
+
+    Sign-in links, Google's reply and Meta's webhook check all carry one-time values or
+    tokens there.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            path, mark, _ = args[2].partition("?")
+            if mark:
+                record.args = (*args[:2], f"{path}?[hidden]", *args[3:])
+        return True
 
 
 def create_app(
     settings: Settings | None = None,
     database: DatabaseLike | None = None,
     handler: MessageHandler | None = None,
+    mailroom: MailDesk | None = None,
 ) -> FastAPI:
     """Build the app. Tests pass their own settings, a stand-in database and handler."""
     settings = settings or get_settings()
@@ -50,6 +103,9 @@ def create_app(
     # The HTTP library logs every address it calls. Those can carry identifiers, so keep
     # only its warnings.
     logging.getLogger("httpx2").setLevel(logging.WARNING)
+    access_log = logging.getLogger("uvicorn.access")
+    if not any(isinstance(item, NoQueryStrings) for item in access_log.filters):
+        access_log.addFilter(NoQueryStrings())
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -58,13 +114,18 @@ def create_app(
             db = Database(settings.database_url)
         app.state.database = db
         app.state.handler = handler
+        app.state.mailroom = mailroom
 
         http: httpx2.AsyncClient | None = None
+        clock: asyncio.Task | None = None
         missing = settings.missing_for_messaging()
         if handler is None and isinstance(db, Database) and not missing:
             http = httpx2.AsyncClient(timeout=httpx2.Timeout(60.0, connect=10.0))
             try:
-                app.state.handler = await _build_assistant(settings, db, http)
+                app.state.handler, app.state.mailroom = await _build_assistant(settings, db, http)
+                if app.state.mailroom is not None:
+                    # E2: the hourly check, and summaries at the times the user set.
+                    clock = asyncio.create_task(_mail_clock(app.state.mailroom))
             except CatalogError as error:
                 # The server stays up so /healthz works and the log can be read.
                 logger.error("WhatsApp chat is off. The models file needs fixing: %s", error)
@@ -74,6 +135,10 @@ def create_app(
 
         yield
 
+        if clock is not None:
+            clock.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await clock
         if http is not None:
             await http.aclose()
         if db is not None:
@@ -127,6 +192,47 @@ def create_app(
             raise HTTPException(status.HTTP_403_FORBIDDEN, "verification failed")
         return challenge
 
+    @app.get("/connect/gmail")
+    async def connect_gmail(t: str = Query("", max_length=200)) -> Response:
+        """The one-time link Tanios sends on WhatsApp. It leads to Google's own sign-in."""
+        desk: MailDesk | None = app.state.mailroom
+        target = await desk.consent_url(t) if desk is not None and t else None
+        if target is None:
+            return page(
+                "This link no longer works",
+                "Links work once, for 15 minutes. Send connect gmail to Tanios on WhatsApp "
+                "for a new one.",
+                status.HTTP_404_NOT_FOUND,
+            )
+        return RedirectResponse(
+            target,
+            status.HTTP_303_SEE_OTHER,
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+        )
+
+    @app.get("/oauth/google/callback")
+    async def google_callback(
+        state: str = Query("", max_length=200),
+        code: str = Query("", max_length=2000),
+        error: str = Query("", max_length=200),
+    ) -> Response:
+        """Where Google sends the user after they approve or refuse."""
+        desk: MailDesk | None = app.state.mailroom
+        address = None
+        if desk is not None and state and code and not error:
+            address = await desk.finish_connection(state, code)
+        if address is None:
+            return page(
+                "Gmail was not connected",
+                "Nothing was changed. Send connect gmail to Tanios on WhatsApp to try again.",
+                status.HTTP_400_BAD_REQUEST,
+            )
+        return page(
+            "Gmail is connected",
+            f"Tanios can now read and label mail for {address}. You can close this page "
+            "and go back to WhatsApp.",
+        )
+
     @app.post("/webhooks/whatsapp")
     async def receive_webhook(request: Request, background: BackgroundTasks) -> dict[str, str]:
         """Every incoming WhatsApp message arrives here."""
@@ -157,9 +263,15 @@ def create_app(
     return app
 
 
+async def _mail_clock(desk: MailDesk) -> None:
+    while True:
+        await desk.run_due()
+        await asyncio.sleep(MAIL_TICK_SECONDS)
+
+
 async def _build_assistant(
     settings: Settings, database: Database, http: httpx2.AsyncClient
-) -> Assistant:
+) -> tuple[Assistant, Mailroom | None]:
     catalog = load_catalog(resolve_path(settings.models_file))
     store = SqlStore(database.sessions)
     router = Router(
@@ -187,13 +299,66 @@ async def _build_assistant(
     )
     if not router.voice_ready():
         logger.warning("voice notes are off: no speech model can be reached")
-    return Assistant(
+    memories = await _open_memories(settings, store)
+    mailroom = _open_mailroom(settings, database, http, store, router, whatsapp, memories)
+    assistant = Assistant(
         store,
         whatsapp,
         router,
         audio=FfmpegConverter(),
-        memories=await _open_memories(settings, store),
+        memories=memories,
+        mail=mailroom,
         ack_after_seconds=settings.ack_after_seconds,
+    )
+    return assistant, mailroom
+
+
+def _open_mailroom(
+    settings: Settings,
+    database: Database,
+    http: httpx2.AsyncClient,
+    store: SqlStore,
+    router: Router,
+    whatsapp: CloudApiClient,
+    memories: Memories | None,
+) -> Mailroom | None:
+    """Email is on when the Google settings are complete and models can do the work."""
+    missing = settings.missing_for_gmail()
+    if missing:
+        logger.warning("email is off. Still to set: %s", ", ".join(missing))
+        return None
+    try:
+        box = TokenBox(settings.encryption_key.get_secret_value())
+        if not (router.can_answer(LABEL) and router.can_answer(DRAFT)):
+            raise CatalogError("no model can be reached for the label and draft tasks")
+    except (SealError, CatalogError) as error:
+        logger.error("email is off: %s", error)
+        return None
+
+    base_url = settings.base_url()
+    oauth = GoogleOAuth(
+        http,
+        client_id=settings.google_client_id,
+        client_secret=settings.google_client_secret.get_secret_value(),
+        redirect_uri=f"{base_url}/oauth/google/callback",
+        auth_url=settings.google_auth_url,
+        token_url=settings.google_token_url,
+        revoke_url=settings.google_revoke_url,
+    )
+    logger.info("email is on")
+    return Mailroom(
+        store=SqlMailStore(database.sessions),
+        users=store,
+        oauth=oauth,
+        gmail_for=lambda access_token: GmailApi(
+            http, api_base=settings.gmail_api_base, access_token=access_token
+        ),
+        box=box,
+        router=router,
+        whatsapp=whatsapp,
+        public_url=base_url,
+        timezone=ZoneInfo(settings.timezone),
+        memories=memories,
     )
 
 

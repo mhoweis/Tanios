@@ -64,8 +64,8 @@ As shipped, every model is reached through OpenRouter:
 | Tier | Model | Used for |
 | --- | --- | --- |
 | free | OpenRouter's free router | Simple sorting later on, and chat after the cap is reached |
-| small | Claude Haiku (latest), then Gemini 3.1 Flash Lite | Chat, and later labelling and filing |
-| medium | Claude Sonnet (latest) | The retry for a failed small answer, and later drafting replies |
+| small | Claude Haiku (latest), then Gemini 3.1 Flash Lite | Chat, sorting new email into labels, and later filing |
+| medium | Claude Sonnet (latest) | Writing email replies, and the retry for a failed small answer |
 | top | Claude Opus (latest) | The retry for a failed medium answer, and later long, multi-step jobs |
 
 These were checked on openrouter.ai on 15 November 2026. Prices and model names change.

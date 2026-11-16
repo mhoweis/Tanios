@@ -11,6 +11,7 @@ model that can do each job.
 - Models and your monthly budget: [docs/MODELS-AND-BUDGET.md](docs/MODELS-AND-BUDGET.md)
 - Voice notes: [docs/VOICE-NOTES.md](docs/VOICE-NOTES.md)
 - Memory and Obsidian: [docs/MEMORY.md](docs/MEMORY.md)
+- Email with Gmail: [docs/SETUP-GMAIL.md](docs/SETUP-GMAIL.md)
 
 ## Run it on your own computer
 
@@ -25,7 +26,8 @@ uv run uvicorn tanios.main:create_app --factory --reload
 Then open http://127.0.0.1:8000/healthz. Without a database configured, `/healthz`
 answers `ok` and `/readyz` answers `not ready`; that is expected. WhatsApp chat stays
 off until every setting in `.env.example` is filled in. Memory stays off until
-`TANIOS_VAULTS_DIR` names a folder for the vaults.
+`TANIOS_VAULTS_DIR` names a folder for the vaults. Email stays off until the three
+Google settings are filled in.
 
 ## Check the code
 

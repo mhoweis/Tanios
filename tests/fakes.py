@@ -1,13 +1,21 @@
 """Stand-ins for the outside world, shaped like the real interfaces."""
 
 import asyncio
-from dataclasses import dataclass, field
+import base64
+import email
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
 from tanios.audio import AudioError
 from tanios.catalog import Catalog, Provider, parse_catalog
+from tanios.gmail.client import GmailAuthError, GmailError, GmailNotFound
+from tanios.gmail.message import Email, addresses
+from tanios.gmail.oauth import Grant
 from tanios.llm import ModelError, ModelReply
+from tanios.mailstore import Connection, Draft, SortedEmail
 from tanios.router import Router
 from tanios.speech import Transcript
 from tanios.store import UsageEntry, UsageSummary, User, normalize_phone
@@ -40,6 +48,7 @@ class InMemoryStore:
             "allow_free_for_private": allow_free_for_private,
             "cap_warned_month": None,
             "cap_reached_month": None,
+            "last_message_at": None,
         }
         return user_id
 
@@ -76,6 +85,12 @@ class InMemoryStore:
                 if user["wa_user_id"] == wa_user_id:
                     return self.user(user_id)
         return None
+
+    async def user_by_id(self, user_id: int) -> User | None:
+        return self.user(user_id) if user_id in self.users else None
+
+    async def note_message(self, user_id: int, at: datetime) -> None:
+        self.users[user_id]["last_message_at"] = at
 
     async def first_contact_from_stranger(self, sender_key: str) -> bool:
         if sender_key in self.strangers:
@@ -218,7 +233,13 @@ TEST_CATALOG: Catalog = parse_catalog(
             "medium": [{"provider": "openrouter", "model": "medium-model"}],
             "top": [{"provider": "openrouter", "model": "top-model"}],
         },
-        "tasks": {"chat": "small", "sort": "free", "draft": "medium", "plan": "top"},
+        "tasks": {
+            "chat": "small",
+            "sort": "free",
+            "label": "small",
+            "draft": "medium",
+            "plan": "top",
+        },
         "speech": {
             "transcribe": [
                 {
@@ -256,6 +277,8 @@ class FakeGateway:
     by_model: dict[str, object] = field(default_factory=dict)
     costs: dict[str, Decimal] = field(default_factory=dict)
     calls: list[dict] = field(default_factory=list)
+    # When set, it writes the answer from the call (model, system, user).
+    script: Callable[[dict], str] | None = None
 
     @property
     def prompts(self) -> list[str]:
@@ -287,6 +310,8 @@ class FakeGateway:
         if self.delay_seconds:
             await asyncio.sleep(self.delay_seconds)
         behaviour = self.by_model.get(model, self.answer)
+        if self.script is not None and model not in self.by_model:
+            behaviour = self.script(self.calls[-1])
         if self.fails or isinstance(behaviour, Exception):
             raise behaviour if isinstance(behaviour, Exception) else ModelError("HTTP 500")
         default_cost = Decimal(0) if "free" in model else self.cost
@@ -411,3 +436,301 @@ def webhook_payload(
             }
         ],
     }
+
+
+# Gmail ---------------------------------------------------------------------------------
+
+
+class InMemoryMailStore:
+    def __init__(self) -> None:
+        self.links: dict[str, dict] = {}
+        self.conns: dict[int, Connection] = {}
+        self.emails: list[SortedEmail] = []
+        self.reported: set[tuple[int, str]] = set()
+        self.drafts: list[Draft] = []
+
+    async def add_link(self, token_hash: str, user_id: int, expires_at: datetime) -> None:
+        self.links = {k: v for k, v in self.links.items() if v["user_id"] != user_id}
+        self.links[token_hash] = {"user_id": user_id, "expires_at": expires_at, "used": False}
+
+    async def link_user(self, token_hash: str, now: datetime) -> int | None:
+        link = self.links.get(token_hash)
+        if link is None or link["used"] or link["expires_at"] <= now:
+            return None
+        return link["user_id"]
+
+    async def use_link(self, token_hash: str, now: datetime) -> int | None:
+        user_id = await self.link_user(token_hash, now)
+        if user_id is not None:
+            self.links[token_hash]["used"] = True
+        return user_id
+
+    async def save_connection(
+        self, user_id: int, address: str, sealed_token: str, now: datetime
+    ) -> None:
+        self.conns[user_id] = Connection(user_id, address, sealed_token, connected_at=now)
+
+    async def connection(self, user_id: int) -> Connection | None:
+        return self.conns.get(user_id)
+
+    async def connections(self) -> list[Connection]:
+        return [self.conns[user_id] for user_id in sorted(self.conns)]
+
+    async def drop_connection(self, user_id: int) -> None:
+        self.conns.pop(user_id, None)
+
+    async def mark_checked(self, user_id: int, now: datetime) -> None:
+        if user_id in self.conns:
+            self.conns[user_id] = replace(self.conns[user_id], last_checked_at=now)
+
+    async def set_digest_times(self, user_id: int, times: tuple[str, ...]) -> None:
+        self.conns[user_id] = replace(self.conns[user_id], digest_times=times)
+
+    async def mark_digest(self, user_id: int, key: str) -> None:
+        self.conns[user_id] = replace(self.conns[user_id], last_digest_key=key)
+
+    async def known_ids(self, user_id: int, gmail_ids: list[str]) -> set[str]:
+        return {e.gmail_id for e in self.emails if e.user_id == user_id} & set(gmail_ids)
+
+    async def add_email(self, email: SortedEmail, now: datetime) -> None:
+        if not await self.known_ids(email.user_id, [email.gmail_id]):
+            self.emails.append(email)
+
+    async def unreported(self, user_id: int) -> list[SortedEmail]:
+        rows = [
+            e
+            for e in self.emails
+            if e.user_id == user_id and (user_id, e.gmail_id) not in self.reported
+        ]
+        return sorted(rows, key=lambda e: e.received_at)
+
+    async def show_list(self, user_id: int, gmail_ids: list[str], also_seen: list[str]) -> None:
+        numbers = {gmail_id: number for number, gmail_id in enumerate(gmail_ids, start=1)}
+        self.emails = [
+            replace(e, list_number=numbers.get(e.gmail_id)) if e.user_id == user_id else e
+            for e in self.emails
+        ]
+        self.reported |= {(user_id, gmail_id) for gmail_id in [*gmail_ids, *also_seen]}
+
+    async def email_number(self, user_id: int, number: int) -> SortedEmail | None:
+        for e in self.emails:
+            if e.user_id == user_id and e.list_number == number:
+                return e
+        return None
+
+    async def add_draft(self, *, user_id: int, now: datetime, **fields) -> Draft:
+        number = max((d.number for d in self.drafts if d.user_id == user_id), default=0) + 1
+        draft = Draft(
+            id=len(self.drafts) + 1, user_id=user_id, number=number, status="pending", **fields
+        )
+        self.drafts.append(draft)
+        return draft
+
+    async def open_drafts(self, user_id: int) -> list[Draft]:
+        return [d for d in self.drafts if d.user_id == user_id and d.status == "pending"]
+
+    def _swap(self, draft_id: int, **changes) -> None:
+        self.drafts = [replace(d, **changes) if d.id == draft_id else d for d in self.drafts]
+
+    async def revise_draft(self, draft_id: int, **changes) -> None:
+        self._swap(draft_id, **changes)
+
+    async def move_draft(self, draft_id: int, before: str, after: str, now: datetime) -> bool:
+        for draft in self.drafts:
+            if draft.id == draft_id and draft.status == before:
+                self._swap(draft_id, status=after)
+                return True
+        return False
+
+
+class FakeOAuth:
+    """Stands in for Google sign-in."""
+
+    def __init__(self) -> None:
+        self.revoked = False  # the user removed Tanios in their Google account
+        self.permission_granted = True
+        self.revoke_fails = False
+        self.exchanged: list[str] = []
+        self.refreshes = 0
+        self.revocations: list[str] = []
+
+    def consent_url(self, state: str) -> str:
+        return f"https://accounts.google.example/auth?state={state}"
+
+    async def exchange(self, code: str) -> Grant:
+        self.exchanged.append(code)
+        if code == "bad-code":
+            raise GmailError("HTTP 400")
+        if not self.permission_granted:
+            raise GmailAuthError("permission for Gmail was not granted")
+        return Grant(access_token="access-1", expires_in=3600, refresh_token="refresh-secret")
+
+    async def refresh(self, refresh_token: str) -> tuple[str, int]:
+        self.refreshes += 1
+        if self.revoked or refresh_token != "refresh-secret":
+            raise GmailAuthError("Google no longer accepts this sign-in")
+        return f"access-{self.refreshes + 1}", 3600
+
+    async def revoke(self, refresh_token: str) -> None:
+        if self.revoke_fails:
+            raise GmailError("ConnectError")
+        self.revocations.append(refresh_token)
+        self.revoked = True
+
+
+def an_email(
+    gmail_id: str,
+    subject: str,
+    text: str = "Hello.",
+    *,
+    sender: str = "Rana Haddad",
+    sender_address: str = "rana@example.com",
+    to: tuple[str, ...] = ("owner@example.com",),
+    cc: tuple[str, ...] = (),
+    reply_to: str | None = None,
+    thread_id: str | None = None,
+    received_at: datetime | None = None,
+) -> Email:
+    return Email(
+        id=gmail_id,
+        thread_id=thread_id or f"t-{gmail_id}",
+        sender=sender,
+        sender_address=sender_address,
+        to=to,
+        cc=cc,
+        reply_to=reply_to,
+        subject=subject,
+        message_id=f"<{gmail_id}@mail.example.com>",
+        references="",
+        received_at=received_at or datetime(2026, 11, 15, 11, 0, tzinfo=UTC),
+        text=text,
+    )
+
+
+class FakeGmail:
+    """One mailbox. It has no way to delete, archive or forward, like the real client."""
+
+    def __init__(self, oauth: FakeOAuth, address: str = "owner@example.com") -> None:
+        self._oauth = oauth
+        self.own_address = address
+        self.inbox: list[Email] = []  # newest first
+        self.labels: dict[str, str] = {}
+        self.label_creations: list[str] = []
+        self.applied: list[tuple[str, str]] = []  # (message id, label name)
+        self.drafts: dict[str, dict] = {}
+        self.sent: list[dict] = []
+        self.calls: list[str] = []
+        self.fail_send = False
+        self._token: Callable | None = None
+
+    def bind(self, access_token: Callable) -> "FakeGmail":
+        self._token = access_token
+        return self
+
+    def deliver(self, *emails: Email) -> None:
+        self.inbox[:0] = list(reversed(emails))
+
+    async def _enter(self, call: str) -> None:
+        self.calls.append(call)
+        token = await self._token(False)
+        if self._oauth.revoked:
+            # Google refuses a revoked token; a real client then asks for a fresh one.
+            token = await self._token(True)
+        assert token.startswith("access-")
+
+    async def address(self) -> str:
+        await self._enter("address")
+        return self.own_address
+
+    async def inbox_ids(self, *, after: datetime, limit: int) -> list[str]:
+        await self._enter("inbox_ids")
+        return [e.id for e in self.inbox if e.received_at > after][:limit]
+
+    async def message(self, message_id: str) -> Email:
+        await self._enter("message")
+        for item in self.inbox:
+            if item.id == message_id:
+                return item
+        raise GmailNotFound("not found")
+
+    async def thread(self, thread_id: str) -> list[Email]:
+        await self._enter("thread")
+        found = [e for e in self.inbox if e.thread_id == thread_id]
+        if not found:
+            raise GmailNotFound("not found")
+        return sorted(found, key=lambda e: e.received_at)
+
+    async def ensure_labels(self, names: list[str]) -> dict[str, str]:
+        await self._enter("ensure_labels")
+        for name in names:
+            if name not in self.labels:
+                self.labels[name] = f"Label_{len(self.labels) + 1}"
+                self.label_creations.append(name)
+        return {name: self.labels[name] for name in names}
+
+    async def add_label(self, message_id: str, label_id: str) -> None:
+        await self._enter("add_label")
+        name = next(name for name, value in self.labels.items() if value == label_id)
+        self.applied.append((message_id, name))
+
+    def _read(self, raw: str) -> dict:
+        message = email.message_from_bytes(base64.urlsafe_b64decode(raw))
+        return {
+            "to": addresses(message.get("To", "")),
+            "cc": addresses(message.get("Cc", "")),
+            "subject": message.get("Subject", ""),
+            "in_reply_to": message.get("In-Reply-To", ""),
+            "body": message.get_payload(decode=True).decode().strip(),
+        }
+
+    async def create_draft(self, *, thread_id: str, raw: str) -> str:
+        await self._enter("create_draft")
+        draft_id = f"draft-{len(self.drafts) + 1}"
+        self.drafts[draft_id] = {"thread_id": thread_id, **self._read(raw)}
+        return draft_id
+
+    async def update_draft(self, draft_id: str, *, thread_id: str, raw: str) -> None:
+        await self._enter("update_draft")
+        if draft_id not in self.drafts:
+            raise GmailNotFound("not found")
+        self.drafts[draft_id] = {"thread_id": thread_id, **self._read(raw)}
+
+    async def draft_recipients(self, draft_id: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        await self._enter("draft_recipients")
+        if draft_id not in self.drafts:
+            raise GmailNotFound("not found")
+        return self.drafts[draft_id]["to"], self.drafts[draft_id]["cc"]
+
+    async def send_draft(self, draft_id: str) -> None:
+        await self._enter("send_draft")
+        if self.fail_send:
+            raise GmailError("HTTP 500")
+        if draft_id not in self.drafts:
+            raise GmailNotFound("not found")
+        await asyncio.sleep(0)
+        self.sent.append(self.drafts.pop(draft_id))
+
+
+def mail_model(
+    labels: dict[str, str] | None = None, draft: str = "Yes, Thursday works."
+) -> Callable:
+    """A model script for mail: labels emails by subject, and writes a fixed reply.
+
+    `labels` maps a word in the subject to a label; anything else is fyi.
+    """
+    labels = labels or {}
+
+    def answer(call: dict) -> str:
+        if call["system"].startswith("You sort"):
+            lines = []
+            blocks = re.findall(r'<email number="(\d+)">\n(.*?)\n</email>', call["user"], re.S)
+            for number, block in blocks:
+                subject = re.search(r"^Subject: (.*)$", block, re.M).group(1)
+                label = next((v for k, v in labels.items() if k in subject), "fyi")
+                lines.append(f"{number} | {label} | About {subject.lower()}.")
+            return "\n".join(lines)
+        if call["system"].startswith("You write an email reply"):
+            return draft
+        return "Here is your answer."
+
+    return answer

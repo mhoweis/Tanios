@@ -88,3 +88,7 @@ price_per_million_chars = 15.00
 
 [tasks]
 chat = "small"
+# Sorting new email into labels, several emails in one call.
+label = "small"
+# Writing a reply to an email.
+draft = "medium"
