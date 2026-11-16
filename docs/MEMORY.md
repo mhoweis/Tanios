@@ -41,7 +41,7 @@ Good to know:
 Instructions.md     how you want Tanios to work (you edit this)
 Memory/             one note per thing you asked it to remember
 Inbox/              quick notes, named with the date
-Files/              for files you ask it to save (arrives in a later update)
+Files/              files you ask it to save, and an Index note listing them (see FILES.md)
 Log/                one note per day listing what Tanios did
 ```
 

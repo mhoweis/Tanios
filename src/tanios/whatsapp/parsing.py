@@ -21,6 +21,10 @@ class InboundMessage:
     phone_number_id: str | None
     # For audio, image and other media messages: Meta's ID for the file.
     media_id: str | None = None
+    # For files: the words sent with it, its own name (documents only) and its type.
+    caption: str | None = None
+    filename: str | None = None
+    mime_type: str | None = None
 
     @property
     def sender_key(self) -> str:
@@ -76,7 +80,14 @@ def _parse_message(raw: dict, phone_number_id: Any) -> InboundMessage | None:
         wa_user_id=wa_user_id,
         phone_number_id=phone_number_id if isinstance(phone_number_id, str) else None,
         media_id=media_id if isinstance(media_id, str) and media_id else None,
+        caption=_text(media.get("caption")),
+        filename=_text(media.get("filename")),
+        mime_type=_text(media.get("mime_type")),
     )
+
+
+def _text(value: Any) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _dicts(value: Any) -> list[dict]:

@@ -23,6 +23,14 @@ _SPACE = re.compile(r"\s+")
 
 
 @dataclass(frozen=True)
+class Attachment:
+    filename: str
+    mime_type: str
+    size: int
+    attachment_id: str
+
+
+@dataclass(frozen=True)
 class Email:
     id: str
     thread_id: str
@@ -36,6 +44,7 @@ class Email:
     references: str
     received_at: datetime
     text: str
+    attachments: tuple[Attachment, ...] = ()
 
     @property
     def people(self) -> set[str]:
@@ -123,6 +132,36 @@ def _bodies(part: object, found: dict[str, list[str]], depth: int = 0) -> None:
         _bodies(child, found, depth + 1)
 
 
+def _attachments(part: object, found: list[Attachment], depth: int = 0) -> None:
+    """Collect the files attached to a message: their names and sizes, not their bytes."""
+    if not isinstance(part, dict) or depth > 8 or len(found) >= 50:
+        return
+    body = part.get("body") if isinstance(part.get("body"), dict) else {}
+    filename, attachment_id, size = part.get("filename"), body.get("attachmentId"), body.get("size")
+    if isinstance(filename, str) and filename.strip() and isinstance(attachment_id, str):
+        found.append(
+            Attachment(
+                filename=one_line(filename, 200),
+                mime_type=str(part.get("mimeType") or "").lower(),
+                size=size if isinstance(size, int) and not isinstance(size, bool) else 0,
+                attachment_id=attachment_id,
+            )
+        )
+    for child in part.get("parts") or []:
+        _attachments(child, found, depth + 1)
+
+
+def attachment_bytes(resource: object) -> bytes:
+    """The bytes from Gmail's answer for one attachment. Raises ValueError if unreadable."""
+    data = resource.get("data") if isinstance(resource, dict) else None
+    if not isinstance(data, str) or not data:
+        raise ValueError("no attachment data")
+    try:
+        return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+    except (binascii.Error, ValueError):
+        raise ValueError("unreadable attachment data") from None
+
+
 def parse_message(resource: object) -> Email:
     """A Gmail API message (format=full) as an Email. Raises ValueError if it is malformed."""
     if not isinstance(resource, dict):
@@ -141,6 +180,8 @@ def parse_message(resource: object) -> Email:
 
     found: dict[str, list[str]] = {"text/plain": [], "text/html": []}
     _bodies(payload, found)
+    attached: list[Attachment] = []
+    _attachments(payload, attached)
     text = "\n".join(found["text/plain"]).strip()
     if not text:
         text = html_to_text("\n".join(found["text/html"]))
@@ -171,6 +212,7 @@ def parse_message(resource: object) -> Email:
         references=one_line(headers.get("references", ""), 4000),
         received_at=received,
         text=text[:MAX_TEXT_CHARS],
+        attachments=tuple(attached),
     )
 
 

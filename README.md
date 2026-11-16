@@ -12,6 +12,7 @@ model that can do each job.
 - Voice notes: [docs/VOICE-NOTES.md](docs/VOICE-NOTES.md)
 - Memory and Obsidian: [docs/MEMORY.md](docs/MEMORY.md)
 - Email with Gmail: [docs/SETUP-GMAIL.md](docs/SETUP-GMAIL.md)
+- Saving files: [docs/FILES.md](docs/FILES.md)
 
 ## Run it on your own computer
 

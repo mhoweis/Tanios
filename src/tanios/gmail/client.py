@@ -13,11 +13,13 @@ from typing import Protocol
 
 import httpx2
 
-from tanios.gmail.message import Email, parse_message, recipients_of
+from tanios.gmail.message import Email, attachment_bytes, parse_message, recipients_of
 
 logger = logging.getLogger(__name__)
 
 _ID = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+# Gmail's attachment IDs are long: several hundred characters is normal.
+_ATTACHMENT_ID = re.compile(r"^[A-Za-z0-9_\-]{1,2000}$")
 
 # Method and path, relative to /gmail/v1/users/me. Anything else is refused before it
 # is sent. Note what is absent: DELETE, trash, batchModify, settings, filters, forwarding.
@@ -27,6 +29,7 @@ ALLOWED_CALLS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("GET", r"^/profile$"),
         ("GET", r"^/messages$"),
         ("GET", r"^/messages/[A-Za-z0-9_\-]+$"),
+        ("GET", r"^/messages/[A-Za-z0-9_\-]+/attachments/[A-Za-z0-9_\-]+$"),
         ("GET", r"^/threads/[A-Za-z0-9_\-]+$"),
         ("GET", r"^/labels$"),
         ("POST", r"^/labels$"),
@@ -63,6 +66,10 @@ class Gmail(Protocol):
     async def message(self, message_id: str) -> Email: ...
 
     async def thread(self, thread_id: str) -> list[Email]: ...
+
+    async def attachment(self, message_id: str, attachment_id: str) -> bytes:
+        """The bytes of one file attached to a message."""
+        ...
 
     async def ensure_labels(self, names: list[str]) -> dict[str, str]:
         """Label name to label ID, creating the labels that do not exist yet."""
@@ -180,6 +187,17 @@ class GmailApi:
             except ValueError:
                 continue
         return emails
+
+    async def attachment(self, message_id: str, attachment_id: str) -> bytes:
+        if not isinstance(attachment_id, str) or not _ATTACHMENT_ID.match(attachment_id):
+            raise GmailError("unexpected ID")
+        resource = await self._call(
+            "GET", f"/messages/{_checked(message_id)}/attachments/{attachment_id}"
+        )
+        try:
+            return attachment_bytes(resource)
+        except ValueError:
+            raise GmailError("unreadable attachment") from None
 
     async def ensure_labels(self, names: list[str]) -> dict[str, str]:
         listing = await self._call("GET", "/labels")

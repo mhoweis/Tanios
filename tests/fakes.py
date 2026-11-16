@@ -12,14 +12,14 @@ from decimal import Decimal
 from tanios.audio import AudioError
 from tanios.catalog import Catalog, Provider, parse_catalog
 from tanios.gmail.client import GmailAuthError, GmailError, GmailNotFound
-from tanios.gmail.message import Email, addresses
+from tanios.gmail.message import Attachment, Email, addresses
 from tanios.gmail.oauth import Grant
 from tanios.llm import ModelError, ModelReply
 from tanios.mailstore import Connection, Draft, SortedEmail
 from tanios.router import Router
 from tanios.speech import Transcript
 from tanios.store import UsageEntry, UsageSummary, User, normalize_phone
-from tanios.whatsapp.client import WhatsAppSendError
+from tanios.whatsapp.client import MediaTooLarge, WhatsAppSendError
 from tanios.whatsapp.parsing import InboundMessage
 
 
@@ -154,10 +154,12 @@ class FakeWhatsApp:
     async def send_text(self, *, phone: str | None, wa_user_id: str | None, body: str) -> None:
         self.sent.append(SentMessage(phone, wa_user_id, body))
 
-    async def download_media(self, media_id: str) -> bytes:
+    async def download_media(self, media_id: str, max_bytes: int = 16 * 1024 * 1024) -> bytes:
         self.downloads.append(media_id)
         if media_id not in self.media:
             raise WhatsAppSendError("HTTP 404")
+        if len(self.media[media_id]) > max_bytes:
+            raise MediaTooLarge("media file is too large")
         return self.media[media_id]
 
     async def send_voice(self, *, phone: str | None, wa_user_id: str | None, ogg: bytes) -> None:
@@ -390,6 +392,30 @@ def voice_message(
     )
 
 
+def file_message(
+    media_id: str = "FILE1",
+    *,
+    kind: str = "document",
+    caption: str | None = None,
+    filename: str | None = "scan0001.pdf",
+    mime_type: str | None = "application/pdf",
+    sender: str | None = OWNER,
+    message_id: str = "wamid.f1",
+) -> InboundMessage:
+    return InboundMessage(
+        id=message_id,
+        kind=kind,
+        text=None,
+        phone=sender,
+        wa_user_id=None,
+        phone_number_id="1234567890",
+        media_id=media_id,
+        caption=caption,
+        filename=filename if kind == "document" else None,
+        mime_type=mime_type,
+    )
+
+
 def webhook_payload(
     body: str = "Hi!",
     *,
@@ -590,6 +616,7 @@ def an_email(
     reply_to: str | None = None,
     thread_id: str | None = None,
     received_at: datetime | None = None,
+    attachments: tuple[Attachment, ...] = (),
 ) -> Email:
     return Email(
         id=gmail_id,
@@ -604,6 +631,7 @@ def an_email(
         references="",
         received_at=received_at or datetime(2026, 11, 15, 11, 0, tzinfo=UTC),
         text=text,
+        attachments=attachments,
     )
 
 
@@ -620,6 +648,7 @@ class FakeGmail:
         self.drafts: dict[str, dict] = {}
         self.sent: list[dict] = []
         self.calls: list[str] = []
+        self.files: dict[str, bytes] = {}  # attachment ID -> bytes
         self.fail_send = False
         self._token: Callable | None = None
 
@@ -659,6 +688,12 @@ class FakeGmail:
         if not found:
             raise GmailNotFound("not found")
         return sorted(found, key=lambda e: e.received_at)
+
+    async def attachment(self, message_id: str, attachment_id: str) -> bytes:
+        await self._enter("attachment")
+        if attachment_id not in self.files:
+            raise GmailNotFound("not found")
+        return self.files[attachment_id]
 
     async def ensure_labels(self, names: list[str]) -> dict[str, str]:
         await self._enter("ensure_labels")

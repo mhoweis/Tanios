@@ -20,6 +20,10 @@ class WhatsAppSendError(Exception):
     pass
 
 
+class MediaTooLarge(WhatsAppSendError):
+    """The file a user sent is over the size the caller allows."""
+
+
 class WhatsAppClient(Protocol):
     """Tests use a stand-in with this shape (tests/fakes.py)."""
 
@@ -27,8 +31,8 @@ class WhatsAppClient(Protocol):
         """Send to a phone number when we have one, otherwise to the WhatsApp user ID."""
         ...
 
-    async def download_media(self, media_id: str) -> bytes:
-        """The bytes of a file a user sent, by Meta's media ID."""
+    async def download_media(self, media_id: str, max_bytes: int = MAX_MEDIA_BYTES) -> bytes:
+        """The bytes of a file a user sent, by Meta's media ID. MediaTooLarge if over."""
         ...
 
     async def send_voice(self, *, phone: str | None, wa_user_id: str | None, ogg: bytes) -> None:
@@ -84,7 +88,7 @@ class CloudApiClient:
             }
             await self._post_message(payload)
 
-    async def download_media(self, media_id: str) -> bytes:
+    async def download_media(self, media_id: str, max_bytes: int = MAX_MEDIA_BYTES) -> bytes:
         if not media_id.isalnum():
             raise WhatsAppSendError("unexpected media ID")
         # Step 1: ask Meta where the file is. Step 2: fetch it from there.
@@ -95,13 +99,13 @@ class CloudApiClient:
             size = info.get("file_size", 0)
         except (ValueError, KeyError, TypeError):
             raise WhatsAppSendError("unreadable media details") from None
-        if isinstance(size, int) and size > MAX_MEDIA_BYTES:
-            raise WhatsAppSendError("media file is too large")
+        if isinstance(size, int) and size > max_bytes:
+            raise MediaTooLarge("media file is too large")
         if not self._is_meta_host(url):
             raise WhatsAppSendError("media address is not on a Meta host")
         content = (await self._get(url)).content
-        if len(content) > MAX_MEDIA_BYTES:
-            raise WhatsAppSendError("media file is too large")
+        if len(content) > max_bytes:
+            raise MediaTooLarge("media file is too large")
         return content
 
     async def send_voice(self, *, phone: str | None, wa_user_id: str | None, ogg: bytes) -> None:

@@ -33,6 +33,19 @@ _DRAFT = re.compile(
 _NUMBER = r"(?:\s+(?:it|draft|the\s+draft))?(?:\s+#?(\d{1,3}))?"
 _SEND = re.compile(rf"^send{_NUMBER}$", re.IGNORECASE)
 _CANCEL = re.compile(rf"^cancel{_NUMBER}$", re.IGNORECASE)
+_FILE_WORD = r"(?:attachments?|files?|pdfs?|documents?|docs?|photos?|pictures?|images?)"
+_AS_NAME = r"(?:\s+(?:as|under|called|named)\b[\s:]*(?P<name>.*))?"
+_FROM = r"\s+(?:from|in|of|on)\s+(?:e-?mail\s+|number\s+|no\.?\s*|#)?(?P<number>\d{1,2})"
+# "save the attachment from 2 as my lease"
+_ATTACHMENT = re.compile(
+    rf"^(?:save|keep|store|file)\s+(?:the\s+|an\s+|my\s+)?{_FILE_WORD}{_FROM}{_AS_NAME}$",
+    re.IGNORECASE | re.DOTALL,
+)
+# "save lease-scan.pdf from 2 as my lease": the attachment is named.
+_NAMED_ATTACHMENT = re.compile(
+    rf"^(?:save|keep|store|file)\s+[\"'“]?(?P<which>[^\"'”\n]{{1,120}}?\.[A-Za-z0-9]{{1,8}})[\"'”]?{_FROM}{_AS_NAME}$",
+    re.IGNORECASE | re.DOTALL,
+)
 # The colon is what makes it a command: "change my flight" is an ordinary sentence.
 _CHANGE = re.compile(
     r"^change(?:\s+(?:draft\s+)?#?(\d{1,3}))?\s*:\s*(.*)$", re.IGNORECASE | re.DOTALL
@@ -41,11 +54,13 @@ _CHANGE = re.compile(
 
 @dataclass(frozen=True)
 class MailRequest:
-    # connect, disconnect, check, news, digest, draft, send, change or cancel
+    # connect, disconnect, check, news, digest, draft, send, change, cancel or attachment
     kind: str
     number: int | None = None
     text: str = ""
     reply_all: bool = False
+    # For "attachment": which file the user named, when they named one.
+    which: str = ""
     # False for a bare "what's new?", which is only about mail once Gmail is connected.
     certain: bool = True
 
@@ -72,6 +87,12 @@ def parse_mail(said: str) -> MailRequest | None:
         return MailRequest("cancel", number=_number(match.group(1)))
     if match := _CHANGE.match(request):
         return MailRequest("change", number=_number(match.group(1)), text=match.group(2).strip())
+    if match := _ATTACHMENT.match(whole) or _NAMED_ATTACHMENT.match(whole):
+        named = match.groupdict().get("which") or ""
+        name = (match.group("name") or "").strip().strip("\"'“”‘’").strip()
+        return MailRequest(
+            "attachment", number=int(match.group("number")), text=name, which=named.strip()
+        )
     if match := _DIGEST.match(request):
         return MailRequest("digest", text=match.group(1).strip())
     if match := _DRAFT.match(request):

@@ -10,14 +10,14 @@ One line per milestone. Updated in the same pull request that changes it.
 | 3 Voice notes | Built, waiting for the owner's check | Owner runs the checks in docs/VOICE-NOTES.md. |
 | 4 Obsidian memory | Built, waiting for the owner's check | Owner follows docs/MEMORY.md and runs its eight checks. Sync with Obsidian has never run. |
 | 5 Gmail | Built, waiting for the owner's check | Owner follows docs/SETUP-GMAIL.md and runs its ten checks. Nothing has run against the real Google or Gmail services. |
-| 6 Files | Not started | |
+| 6 Files | Built, waiting for the owner's check | Owner runs the seven checks in docs/FILES.md. |
 | 7 Testers | Not started | |
 
-Milestones 1 to 5 were built at the owner's request before the owner's server checks
+Milestones 1 to 6 were built at the owner's request before the owner's server checks
 of the milestones before them. CI has built the Docker images and confirmed the app
-answers `/healthz`, but as of milestone 5 nothing has run against the real Meta,
-OpenRouter, Obsidian or Google services. The first live test covers six milestones at
-once, so expect to find things. Milestone 5 is the first one that can send messages to
+answers `/healthz`, but as of milestone 6 nothing has run against the real Meta,
+OpenRouter, Obsidian or Google services. The first live test covers seven milestones
+at once, so expect to find things. Milestone 5 is the first one that can send messages to
 other people, so its checks matter most.
 
 ## What has been verified, and how
@@ -185,6 +185,56 @@ How the requirements are met, and where they stop short:
 - There is still no conversation history: each question stands on its own.
 - A blank line for a setting that has a default (for example `TANIOS_LOG_LEVEL=`) now
   means the default. Before this milestone it stopped the server from starting.
+
+### Milestone 6
+
+Requirement covered: M6.
+
+- 718 automated tests pass. The file tests write real bytes to a real folder.
+- Breaking any of these on purpose makes tests fail (25 rules tried, all caught): the
+  list of file types that are kept, judging a named file by its extension and not by
+  the type it claims, cleaning the name so it cannot carry a path, never replacing a
+  file of the same name, holding a file until the user says `save`, dropping a held
+  file after an hour, the pause rule, both size checks (the size claimed and the size
+  that arrived), refusing attachments from Suspicious emails, taking a file back out
+  when its index line cannot be written, cleaning the sender's name before it goes in
+  the index, and the log line.
+- The real server was run against stand-in servers with a real vault folder. A PDF sent
+  with `save this as my lease` was stored byte for byte and listed; a `.exe` was
+  refused without being fetched; a stranger's file was never fetched; a photo sent with
+  no caption was held and then saved on `save this as passport photo`; an attachment
+  was saved from a listed email with one read call to Gmail; an attachment on a
+  Suspicious email was refused; "where is my lease?" was answered from the index. No
+  file name or content appeared in the server log.
+- Not yet verified:
+  - The shape of Meta's real webhook for documents and photos (the `caption`,
+    `filename` and `mime_type` fields), and that a media ID can still be fetched up to
+    an hour after the file was sent. Both are from Meta's documentation as I know it,
+    not re-read this session.
+  - Gmail's real answer for an attachment.
+  - That saved files reach the phone through Obsidian Sync. The `--file-types` option
+    in docs/FILES.md was read from the help text of Obsidian Headless 0.0.14 and has
+    not been run. The words used for the phone's Sync settings are from memory.
+  - Large files. The whole file is held in the server's memory while it is saved, so
+    the limit is 25 MB by default and 100 MB at most.
+
+How the requirement is met, and where it stops short:
+
+- **"A file sent on WhatsApp."** Documents, pictures and videos. A file is saved only
+  when the user says so: in its caption, or in a message within the hour after it.
+  A forwarded audio file is still treated as a voice note and transcribed, not saved.
+- **"A named Gmail attachment."** `save the attachment from 2 as ...` for an email in
+  the user's last list. If the email has several, the user names one.
+- **"A clear name."** The name the user gives, or the file's own name tidied up, or
+  for a photo with neither, its kind and the time. No model picks the name.
+- **"A line in Files/Index."** Date, a link to the file, its kind and size, and where
+  it came from.
+- A file that was sent without `save` is remembered only in the running server. After
+  a restart the user sends it again.
+- Tanios does not read files, so "summarise this PDF" is not available. The spec does
+  not ask for it in version 1.
+- Archives, programs, scripts, web pages and Markdown files are refused. This is a
+  choice, not a spec rule: say so if you want `.zip` kept.
 
 ### Milestone 5
 

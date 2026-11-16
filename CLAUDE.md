@@ -50,6 +50,9 @@ The server applies migrations at start with `python -m tanios.migrate`.
   path inside one user's vault folder. Saving, finding and forgetting live in
   `tanios.memory` and use no model. A path is never built from text a user or a model
   wrote without going through `note_title`.
+- A file is stored as bytes through `Memory.keep_file` and is never opened, read, parsed
+  or run. Only the extensions in `tanios.files.KINDS` are saved. Never add one that can
+  run, show as a web page, or pass as a note (`.md`).
 - Gmail is called only through `tanios.gmail.client.GmailApi`. A new kind of call needs
   a line in `ALLOWED_CALLS`, and never one that deletes, archives, trashes, forwards,
   removes a label or changes settings.
