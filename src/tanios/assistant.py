@@ -9,9 +9,19 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from tanios.audio import AudioConverter, AudioError, wav_seconds
+from tanios.files import (
+    KINDS,
+    FileRequest,
+    IncomingFile,
+    extension_of,
+    parse_file_request,
+    readable_size,
+    safe_extension,
+    without_extension,
+)
 from tanios.llm import ModelError
 from tanios.mail import Mailroom
 from tanios.mailtalk import MailRequest, parse_mail
@@ -19,13 +29,23 @@ from tanios.memory import Forgotten, Memory, Note
 from tanios.router import CHAT, BudgetExceeded, Router, Task, money, utc_now
 from tanios.store import Store, UsageSummary, User
 from tanios.vault import VaultError
-from tanios.whatsapp.client import WhatsAppClient, WhatsAppSendError
+from tanios.whatsapp.client import MediaTooLarge, WhatsAppClient, WhatsAppSendError
 from tanios.whatsapp.parsing import InboundMessage
 
 logger = logging.getLogger(__name__)
 
 STRANGER_REPLY = "This is a private assistant. It only answers its registered users."
-UNSUPPORTED_REPLY = "I can only read text messages and voice notes for now."
+UNSUPPORTED_REPLY = "I can only read text messages and voice notes, and save files, for now."
+FILES_OFF_REPLY = "Memory is not set up on this server yet, so I have nowhere to save files."
+NO_FILE_WAITING = (
+    "There is no file waiting. Send me the file first, or send it with a caption such "
+    "as: save this as my lease"
+)
+FILE_FETCH_FAILED = "Sorry, I could not fetch that file from WhatsApp. Please send it again."
+FILE_NOT_SAVED = "Sorry, I could not reach your vault just now. Nothing was saved."
+# How long a file sent without "save" stays ready to be saved.
+FILE_WAIT = timedelta(hours=1)
+FILE_KINDS = {"document", "image", "video"}
 VOICE_OFF_REPLY = "Voice notes are not set up on this server yet. Please send text."
 VOICE_FAILED_REPLY = "Sorry, I could not process that voice note. Please try again or send text."
 VOICE_EMPTY_REPLY = "I could not make out any words in that voice note."
@@ -41,6 +61,9 @@ HELP_REPLY = (
     "remember ... - save something to memory\n"
     "note: ... - put a quick note in your Inbox\n"
     "forget ... - remove something from memory\n"
+    "\n"
+    "Files: send one with the caption: save this as my lease\n"
+    "save the attachment from 2 as ... - keep a file from an email\n"
     "\n"
     "Email:\n"
     "connect gmail / disconnect gmail\n"
@@ -76,7 +99,7 @@ NOTES_LEFT_OUT = (
 
 # Message kinds a person sends on purpose and would expect an answer to. Reactions,
 # read receipts and system notices are ignored silently.
-UNSUPPORTED_KINDS = {"image", "video", "document", "sticker", "location", "contacts"}
+UNSUPPORTED_KINDS = {"sticker", "location", "contacts"}
 
 # A spoken reply longer than this is cut at a sentence, and the full text is sent too.
 # About 90 seconds of speech, which also keeps the file small enough for WhatsApp to show
@@ -94,7 +117,8 @@ _MEMORY_PART = (
     "The user has a memory: notes kept in their own vault. The user saves to it by "
     'starting a message with "remember" or "note:", and removes a memory with "forget". '
     "You cannot save, change or delete notes yourself. If the user asks you to, tell them "
-    "which word to start their message with. "
+    "which word to start their message with. The user can also keep a file there by "
+    'sending it with the caption "save this as ..." You cannot read files. '
 )
 _MAIL_PART = (
     'The user can work on their Gmail with these commands: "check mail", "what\'s '
@@ -114,13 +138,14 @@ def system_prompt(*, memory: bool, mail: bool) -> str:
         for name, on in (
             ("handling email", mail),
             ("remembering things between messages", memory),
-            ("saving files", False),
+            ("saving files", memory),
         )
         if not on
     ]
-    verb = "is" if len(missing) == 1 else "are"
-    listed = " and ".join(filter(None, [", ".join(missing[:-1]), missing[-1]]))
-    text += f"{listed.capitalize()} {verb} still being built; say so plainly if asked. "
+    if missing:
+        verb = "is" if len(missing) == 1 else "are"
+        listed = " and ".join(filter(None, [", ".join(missing[:-1]), missing[-1]]))
+        text += f"{listed.capitalize()} {verb} still being built; say so plainly if asked. "
     return text + _NO_CLAIMS
 
 
@@ -335,8 +360,13 @@ class Assistant:
         memories: Callable[[int], Memory] | None = None,
         mail: Mailroom | None = None,
         ack_after_seconds: float = 8.0,
+        max_file_bytes: int = 25 * 1024 * 1024,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
+        self._max_file_bytes = max_file_bytes
+        # A file sent without "save", per user, until they say what to do with it. Kept
+        # in memory only: after a restart the user sends the file again.
+        self._waiting: dict[int, tuple[IncomingFile, datetime]] = {}
         self._audio = audio
         self._store = store
         self._whatsapp = whatsapp
@@ -373,6 +403,9 @@ class Assistant:
         if message.kind == "audio" and message.media_id:
             await self._voice_note(user, message)
             return
+        if message.kind in FILE_KINDS and message.media_id:
+            await self._file_message(user, message)
+            return
         if message.kind != "text" or not message.text or not message.text.strip():
             if message.kind in UNSUPPORTED_KINDS:
                 await self._reply(message, UNSUPPORTED_REPLY)
@@ -393,6 +426,8 @@ class Assistant:
             await self._do_mail(user, message, mail, spoken=spoken)
         elif user.paused:
             await self._reply(message, PAUSED_REPLY)
+        elif (wish := parse_file_request(said)) is not None:
+            await self._save_waiting_file(user, message, wish, spoken=spoken)
         elif (saving := parse_saving(said)) is not None:
             await self._save(user, message, saving, spoken=spoken)
         else:
@@ -451,8 +486,100 @@ class Assistant:
                 "send": lambda: mail.send(user, request.number),
                 "change": lambda: mail.change(user, request.number, request.text),
                 "cancel": lambda: mail.cancel(user, request.number),
+                "attachment": lambda: mail.save_attachment(
+                    user, request.number or 0, request.which, request.text
+                ),
             }[request.kind]
             await self._reply(message, await self._with_ack(message, work()))
+
+    # Files (M6) -----------------------------------------------------------------------
+
+    async def _file_message(self, user: User, message: InboundMessage) -> None:
+        """A document, picture or video arrived. It is saved only if the user says so."""
+        if user.paused:
+            await self._reply(message, PAUSED_REPLY)
+            return
+        if self._memories is None:
+            await self._reply(message, FILES_OFF_REPLY)
+            return
+        extension = safe_extension(message.filename, message.mime_type)
+        if extension is None:
+            named = extension_of(message.filename)
+            what = f'".{named}" files' if named else "files of that type"
+            await self._reply(
+                message,
+                f"I do not save {what}. I keep documents, pictures, audio and video.",
+            )
+            return
+        file = IncomingFile(message.media_id, extension, message.filename)
+        wish = parse_file_request(message.caption)
+        if wish is not None:
+            await self._keep_file(user, message, file, wish, spoken=False)
+            return
+        self._waiting[user.id] = (file, self._now())
+        await self._reply(
+            message,
+            f"Got your {file.kind}. I cannot read files yet, but I can keep it in your vault. "
+            "Reply: save this as my lease (with your own name for it). "
+            "I will hold it for an hour.",
+        )
+
+    async def _save_waiting_file(
+        self, user: User, message: InboundMessage, wish: FileRequest, *, spoken: bool
+    ) -> None:
+        if self._memories is None:
+            await self._reply(message, FILES_OFF_REPLY)
+            return
+        waiting = self._waiting.get(user.id)
+        if waiting is None or self._now() - waiting[1] > FILE_WAIT:
+            self._waiting.pop(user.id, None)
+            await self._reply(message, NO_FILE_WAITING)
+            return
+        await self._keep_file(user, message, waiting[0], wish, spoken=spoken)
+
+    async def _keep_file(
+        self,
+        user: User,
+        message: InboundMessage,
+        file: IncomingFile,
+        wish: FileRequest,
+        *,
+        spoken: bool,
+    ) -> None:
+        """Fetch the file from WhatsApp and store it. Its bytes are never read or opened."""
+        try:
+            data = await self._with_ack(
+                message, self._whatsapp.download_media(file.media_id, self._max_file_bytes)
+            )
+        except MediaTooLarge:
+            limit = readable_size(self._max_file_bytes)
+            await self._reply(message, f"That file is too large. The most I save is {limit}.")
+            return
+        except WhatsAppSendError as error:
+            logger.warning("could not fetch a file: %s", error)
+            await self._reply(message, FILE_FETCH_FAILED)
+            return
+        memory = self._memories(user.id)
+        try:
+            saved = await asyncio.to_thread(
+                memory.keep_file,
+                data,
+                name=wish.name,
+                extension=file.extension,
+                origin="from WhatsApp",
+                fallback=without_extension(file.filename or ""),
+            )
+        except VaultError as error:
+            logger.warning("vault problem while saving a file: %s", error)
+            await self._reply(message, FILE_NOT_SAVED)
+            return
+        self._waiting.pop(user.id, None)
+        size = readable_size(saved.size)
+        if spoken:
+            confirmation = f"Saved your {KINDS[file.extension]} to Files as {saved.name}."
+        else:
+            confirmation = f'Saved to Files: "{saved.name}" ({size}). It is listed in Files/Index.'
+        await self._send(user, message, confirmation, spoken=spoken)
 
     # Memory (M2, M3, M7) --------------------------------------------------------------
 

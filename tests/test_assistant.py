@@ -100,13 +100,25 @@ def test_w1_the_same_message_delivered_twice_is_answered_once():
     assert len(world.model.prompts) == 1
 
 
-def test_w1_a_photo_gets_a_clear_reply_that_only_text_and_voice_work():
+def test_w1_a_sticker_or_location_gets_a_clear_reply_about_what_tanios_handles():
+    world = World()
+
+    world.receive(
+        replace(text_message("", message_id="wamid.1"), kind="sticker", text=None, media_id="S1"),
+        replace(text_message("", message_id="wamid.2"), kind="location", text=None),
+    )
+
+    assert world.whatsapp.bodies == [replies.UNSUPPORTED_REPLY] * 2
+    assert world.model.prompts == []
+
+
+def test_m6_a_photo_sent_while_memory_is_off_says_there_is_nowhere_to_save_it():
     world = World()
 
     world.receive(replace(text_message(""), kind="image", text=None, media_id="IMG1"))
 
-    assert world.whatsapp.bodies == [replies.UNSUPPORTED_REPLY]
-    assert world.model.prompts == []
+    assert world.whatsapp.bodies == [replies.FILES_OFF_REPLY]
+    assert world.whatsapp.downloads == []
 
 
 def test_w1_reactions_and_system_notices_are_ignored_silently():

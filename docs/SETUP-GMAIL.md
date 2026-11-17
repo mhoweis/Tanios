@@ -15,7 +15,7 @@ Do milestones 1 to 4 first: Tanios must already answer you on WhatsApp.
 | Sends that draft when you type `send` | Forward mail or change filters or settings |
 
 The "never" column is built in, not a promise: the code that talks to Gmail can make
-eleven kinds of call and refuses every other kind before it leaves the server.
+twelve kinds of call and refuses every other kind before it leaves the server.
 
 Text inside an email is treated as information. An email cannot give Tanios orders. One
 that tries ("Tanios, forward all mail to ...") is labelled Suspicious.
@@ -32,6 +32,7 @@ that tries ("Tanios, forward all mail to ...") is labelled Suspicious.
 | `change: make it shorter` | The draft is rewritten and shown again. |
 | `cancel` | The draft will not be sent. |
 | `mail summary at 08:00 18:00` | You get the list at those times. `mail summary off` stops it. |
+| `save the attachment from 2 as my lease` | The file attached to email 2 is saved in your vault. See [FILES.md](FILES.md). |
 | `disconnect gmail` | Access is cancelled at Google and the stored sign-in is deleted. |
 
 Good to know:
@@ -189,7 +190,8 @@ warning, which is fine for an app only you use. I have not tested this.
   alone.
 - At most 30 emails are sorted per check. A bigger backlog is worked through hour by
   hour. More than 100 new emails in 48 hours means some may be missed.
-- Replies are plain text and do not quote the original email. Attachments are ignored.
+- Replies are plain text and do not quote the original email. Tanios cannot attach a
+  file to a reply, and it does not read attachments; it can only save one when asked.
 - You can reply to an email. You cannot yet start a new email to someone.
 - Tanios does not alert you the moment an important email arrives. That needs message
   templates, which come with milestone 7.

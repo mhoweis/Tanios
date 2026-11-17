@@ -5,15 +5,25 @@ so they cost nothing and behave the same every time. A model is only involved wh
 question is answered from the notes that were found.
 """
 
+import contextlib
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
 from pathlib import Path
 
+from tanios.files import KINDS, readable_size
 from tanios.vault import FolderVault, VaultError
 
 INSTRUCTIONS = "Instructions.md"
+FILES_INDEX = "Files/Index.md"
+INDEX_HEADER = (
+    "# Files Tanios saved\n\n"
+    "One line per file, oldest first. Tanios adds a line each time it saves one.\n\n"
+)
+# Picking a free name and writing under it must not be interleaved for two saves.
+_WRITING = threading.Lock()
 FOLDERS = ("Memory", "Inbox", "Files", "Log")
 MARKER = "Write your instructions below this line."
 
@@ -40,7 +50,9 @@ ABOUT = {
     'Say "remember ..." on WhatsApp to add one, or "forget ..." to remove one.\n',
     "Inbox": "Quick notes you send Tanios land here, named with the date.\n\n"
     'Say "note: ..." on WhatsApp to add one.\n',
-    "Files": "Files you ask Tanios to save will appear here. This arrives in a later update.\n",
+    "Files": "Files you ask Tanios to save are kept here, and listed in the Index note.\n\n"
+    'Send a file on WhatsApp with the caption "save this as my lease", or say '
+    '"save the attachment from 2 as my lease" for an email in your list.\n',
 }
 
 MAX_INSTRUCTIONS_CHARS = 4000
@@ -65,6 +77,13 @@ class Note:
     name: str  # what the user sees in Obsidian, without folder or .md
     path: str  # relative to the vault
     text: str  # the note's content, shortened if long
+
+
+@dataclass(frozen=True)
+class SavedFile:
+    name: str  # with its extension, for example "My lease.pdf"
+    path: str  # relative to the vault
+    size: int
 
 
 @dataclass(frozen=True)
@@ -147,16 +166,61 @@ class Memory:
 
     def _save(self, folder: str, title: str, text: str) -> Note:
         self.ensure_layout()
-        name = title
-        counter = 2
-        while self._vault.exists(f"{folder}/{name}.md"):
-            name = f"{title} {counter}"
-            counter += 1
-        path = f"{folder}/{name}.md"
         content = text.strip()
         properties = f"---\ncreated: {self._now():%Y-%m-%dT%H:%M}\nsource: whatsapp\n---\n"
-        self._vault.write(path, f"{properties}{content}\n")
+        with _WRITING:
+            name = self._free_name(folder, title, "md")
+            path = f"{folder}/{name}.md"
+            self._vault.write(path, f"{properties}{content}\n")
         return Note(name=name, path=path, text=content)
+
+    def _free_name(self, folder: str, title: str, extension: str) -> str:
+        """The title, or the title with a number, so nothing already there is replaced."""
+        name = title
+        counter = 2
+        while self._vault.exists(f"{folder}/{name}.{extension}"):
+            name = f"{title} {counter}"
+            counter += 1
+        return name
+
+    # M6: files -------------------------------------------------------------------------
+
+    def keep_file(
+        self, data: bytes, *, name: str, extension: str, origin: str, fallback: str = ""
+    ) -> SavedFile:
+        """Store a file's bytes under Files/ and add its line to the index.
+
+        `name` is what the user asked for and `fallback` the file's own name; both pass
+        through note_title, so neither can carry a path. The bytes are never read.
+        """
+        if extension not in KINDS:
+            raise VaultError("file type is not one Tanios keeps")
+        self.ensure_layout()
+        wanted = name.strip() or fallback.strip()
+        if wanted:
+            title = note_title(wanted)
+        else:
+            title = f"{KINDS[extension].capitalize()} {self._now():%Y-%m-%d %H%M}"
+        with _WRITING:
+            stem = self._free_name("Files", title, extension)
+            saved = SavedFile(f"{stem}.{extension}", f"Files/{stem}.{extension}", len(data))
+            self._vault.write_bytes(saved.path, data)
+            try:
+                if not self._vault.exists(FILES_INDEX):
+                    self._vault.write(FILES_INDEX, INDEX_HEADER)
+                self._vault.append(
+                    FILES_INDEX,
+                    f"- {self._now():%Y-%m-%d} [[{saved.name}]] ({KINDS[extension]}, "
+                    f"{readable_size(saved.size)}, {note_title(origin, 80)})\n",
+                )
+            except VaultError:
+                # A file with no line in the index would be easy to lose. Take it back
+                # out, so "nothing was saved" is true.
+                with contextlib.suppress(VaultError):
+                    self._vault.delete(saved.path)
+                raise
+        self.log(f'Saved "{saved.name}" to Files')
+        return saved
 
     # M4: finding -----------------------------------------------------------------------
 

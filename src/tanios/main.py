@@ -309,6 +309,7 @@ async def _build_assistant(
         memories=memories,
         mail=mailroom,
         ack_after_seconds=settings.ack_after_seconds,
+        max_file_bytes=settings.max_file_mb * 1024 * 1024,
     )
     return assistant, mailroom
 
@@ -359,6 +360,7 @@ def _open_mailroom(
         public_url=base_url,
         timezone=ZoneInfo(settings.timezone),
         memories=memories,
+        max_file_bytes=settings.max_file_mb * 1024 * 1024,
     )
 
 

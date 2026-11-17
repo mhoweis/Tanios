@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     # Dates in note names and the daily log use this time zone, for example Asia/Amman.
     timezone: str = "UTC"
 
+    # M6: the largest file Tanios will save, in megabytes. Obsidian Sync has its own
+    # limit per file, which depends on the plan.
+    max_file_mb: int = Field(default=25, ge=1, le=100)
+
     # Gmail (E1). All four must be set before email switches on. docs/SETUP-GMAIL.md
     # says where each comes from.
     domain: str | None = None  # the server's web address, as used for HTTPS

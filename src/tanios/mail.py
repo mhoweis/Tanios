@@ -19,9 +19,11 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, tzinfo
 
 from tanios.crypto import SealError, TokenBox
+from tanios.files import readable_size, safe_extension, without_extension
 from tanios.gmail.client import Gmail, GmailAuthError, GmailError, GmailNotFound
 from tanios.gmail.message import (
     ADDRESS_IN_TEXT,
+    Attachment,
     Email,
     build_reply,
     is_address,
@@ -85,6 +87,11 @@ OVER_CAP = (
 )
 NO_DRAFT = "There is no draft waiting to be sent."
 SUSPICIOUS_SUMMARY = "Labelled Suspicious. Open it in Gmail with care."
+SUSPICIOUS_NO_SAVE = (
+    "That email is labelled Suspicious, so I will not save anything attached to it. "
+    "If you trust it, open it in Gmail."
+)
+FILES_NEED_MEMORY = "Memory is not set up on this server yet, so I have nowhere to save files."
 SUSPICIOUS_NO_DRAFT = (
     "That email is labelled Suspicious, so I will not draft a reply to it. "
     "If you trust it, answer it in Gmail."
@@ -268,6 +275,32 @@ def thread_prompt(thread: list[Email], own: str) -> str:
     return f"<thread>\nSubject: {_inside_tags(thread[-1].subject)}\n\n{body}\n</thread>"
 
 
+def pick_attachment(
+    attachments: tuple[Attachment, ...], which: str, number: int
+) -> Attachment | str:
+    """The attachment the user named, or the words to say when it cannot be picked."""
+    if not attachments:
+        return f"Email {number} has no attachments."
+    listed = "\n".join(
+        f"- {one_line(a.filename, 80)} ({readable_size(a.size)})" for a in attachments[:10]
+    )
+    if not which:
+        if len(attachments) == 1:
+            return attachments[0]
+        return (
+            f"Email {number} has {len(attachments)} attachments:\n{listed}\n"
+            f"Say which one, for example: save {one_line(attachments[0].filename, 60)} "
+            f"from {number}"
+        )
+    wanted = which.strip().lower()
+    exact = [a for a in attachments if a.filename.lower() == wanted]
+    partial = [a for a in attachments if wanted in a.filename.lower()]
+    matches = exact or partial
+    if len(matches) == 1:
+        return matches[0]
+    return f'Email {number} has no single attachment called "{which}". It has:\n{listed}'
+
+
 def show_draft(draft: Draft, heading: str, *, alone: bool) -> str:
     """E6: the approval message. Every recipient is listed, and new ones are called out."""
     lines = [heading, "", f"To: {', '.join(draft.to)}"]
@@ -313,8 +346,10 @@ class Mailroom:
         public_url: str,
         timezone: tzinfo,
         memories: Callable[[int], Memory] | None = None,
+        max_file_bytes: int = 25 * 1024 * 1024,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
+        self._max_file_bytes = max_file_bytes
         self._store = store
         self._users = users
         self._oauth = oauth
@@ -808,6 +843,67 @@ class Mailroom:
             user=user, task=DRAFT, system=system, prompt="\n\n".join(parts)
         )
         return reply.text.strip()
+
+    # M6: save a named attachment -------------------------------------------------------
+
+    async def save_attachment(self, user: User, number: int, which: str, name: str) -> str:
+        """Save one file attached to a listed email into the vault's Files folder.
+
+        The file is fetched and stored as it is. Nothing reads or opens it, and no model
+        is involved.
+        """
+        if self._memories is None:
+            return FILES_NEED_MEMORY
+        connection = await self._store.connection(user.id)
+        if connection is None:
+            return NOT_CONNECTED
+        listed = await self._store.email_number(user.id, number)
+        if listed is None:
+            return f"There is no email {number} in your last list. Ask what's new? to see it."
+        if listed.category == "suspicious":
+            return SUSPICIOUS_NO_SAVE
+        try:
+            gmail = self._gmail(connection)
+            email = await gmail.message(listed.gmail_id)
+            picked = pick_attachment(email.attachments, which, number)
+            if isinstance(picked, str):
+                return picked
+            extension = safe_extension(picked.filename, picked.mime_type)
+            if extension is None:
+                return (
+                    f'I do not save files of that type ("{one_line(picked.filename, 60)}"). '
+                    "I keep documents, pictures, audio and video."
+                )
+            limit = readable_size(self._max_file_bytes)
+            if picked.size > self._max_file_bytes:
+                return f"That file is {readable_size(picked.size)}. The most I save is {limit}."
+            data = await gmail.attachment(email.id, picked.attachment_id)
+            if len(data) > self._max_file_bytes:
+                return f"That file is {readable_size(len(data))}. The most I save is {limit}."
+        except GmailAuthError:
+            return await self._lose(user.id)
+        except GmailNotFound:
+            return "That email is no longer in Gmail, so I cannot save from it."
+        except GmailError as error:
+            logger.warning("fetching an attachment failed: %s", error)
+            return GMAIL_TROUBLE
+
+        try:
+            saved = await asyncio.to_thread(
+                self._memories(user.id).keep_file,
+                data,
+                name=name,
+                extension=extension,
+                origin=f"from an email by {email.sender}",
+                fallback=without_extension(picked.filename),
+            )
+        except VaultError as error:
+            logger.warning("vault problem while saving a file: %s", error)
+            return "Sorry, I could not reach your vault just now. Nothing was saved."
+        return (
+            f'Saved to Files: "{saved.name}" ({readable_size(saved.size)}). '
+            "It is listed in Files/Index."
+        )
 
     # E5: send, change, cancel ----------------------------------------------------------
 

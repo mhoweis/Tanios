@@ -27,6 +27,8 @@ class Vault(Protocol):
 
     def write(self, path: str, text: str) -> None: ...
 
+    def write_bytes(self, path: str, data: bytes) -> None: ...
+
     def append(self, path: str, text: str) -> None: ...
 
     def delete(self, path: str) -> None: ...
@@ -70,13 +72,16 @@ class FolderVault:
         return data.decode("utf-8", errors="replace")
 
     def write(self, path: str, text: str) -> None:
+        self.write_bytes(path, text.encode("utf-8"))
+
+    def write_bytes(self, path: str, data: bytes) -> None:
         target = self._resolve(path)
         # Write to a hidden temporary file, then swap it in, so a sync that runs at the
         # same moment never sees half a note. Obsidian ignores hidden files.
         temporary = target.parent / f".tanios-{secrets.token_hex(6)}.tmp"
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            temporary.write_text(text, encoding="utf-8")
+            temporary.write_bytes(data)
             os.replace(temporary, target)
         except OSError:
             with contextlib.suppress(OSError):
