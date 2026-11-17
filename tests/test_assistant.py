@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import replace
+from decimal import Decimal
 
 import pytest
 
@@ -10,9 +11,10 @@ from tanios.assistant import Assistant, parse_command
 from tests.fakes import (
     OWNER,
     STRANGER,
-    FakeModel,
+    FakeGateway,
     FakeWhatsApp,
     InMemoryStore,
+    make_router,
     text_message,
 )
 
@@ -20,13 +22,21 @@ from tests.fakes import (
 class World:
     """One assistant wired to stand-ins, with the owner registered."""
 
-    def __init__(self, model: FakeModel | None = None, ack_after_seconds: float = 8.0) -> None:
+    def __init__(
+        self,
+        model: FakeGateway | None = None,
+        ack_after_seconds: float = 8.0,
+        cap: str | None = None,
+    ) -> None:
         self.store = InMemoryStore()
-        self.owner_id = self.store.add_user(OWNER)
+        self.owner_id = self.store.add_user(OWNER, monthly_cap_usd=cap)
         self.whatsapp = FakeWhatsApp()
-        self.model = model or FakeModel()
+        self.model = model or FakeGateway()
         self.assistant = Assistant(
-            self.store, self.whatsapp, self.model, ack_after_seconds=ack_after_seconds
+            self.store,
+            self.whatsapp,
+            make_router(self.store, self.model),
+            ack_after_seconds=ack_after_seconds,
         )
 
     def receive(self, *messages) -> None:
@@ -41,7 +51,7 @@ class World:
 
 
 def test_w1_a_text_message_gets_the_model_answer_in_the_same_chat():
-    world = World(FakeModel(answer="I can chat and answer questions."))
+    world = World(FakeGateway(answer="I can chat and answer questions."))
 
     world.receive(text_message("what can you do?"))
 
@@ -51,7 +61,7 @@ def test_w1_a_text_message_gets_the_model_answer_in_the_same_chat():
 
 
 def test_w1_a_slow_answer_is_preceded_by_working_on_it():
-    world = World(FakeModel(answer="Done.", delay_seconds=0.2), ack_after_seconds=0.05)
+    world = World(FakeGateway(answer="Done.", delay_seconds=0.2), ack_after_seconds=0.05)
 
     world.receive(text_message("write me a long plan"))
 
@@ -59,7 +69,7 @@ def test_w1_a_slow_answer_is_preceded_by_working_on_it():
 
 
 def test_w1_a_fast_answer_sends_no_working_on_it():
-    world = World(FakeModel(answer="4"), ack_after_seconds=5)
+    world = World(FakeGateway(answer="4"), ack_after_seconds=5)
 
     world.receive(text_message("2+2?"))
 
@@ -73,7 +83,7 @@ def test_w1_the_default_wait_before_working_on_it_is_under_ten_seconds():
 
 
 def test_w1_a_model_failure_gets_an_apology_not_silence():
-    world = World(FakeModel(fails=True))
+    world = World(FakeGateway(fails=True))
 
     world.receive(text_message("hello"))
 
@@ -206,15 +216,95 @@ def test_w4_status_says_whether_tanios_is_active_or_paused():
         text_message("status", message_id="wamid.3"),
     )
 
-    assert world.whatsapp.bodies == [
-        replies.STATUS_ACTIVE_REPLY,
-        replies.PAUSE_REPLY,
-        replies.STATUS_PAUSED_REPLY,
-    ]
+    first, pause, second = world.whatsapp.bodies
+    assert first.startswith(replies.STATUS_ACTIVE)
+    assert pause == replies.PAUSE_REPLY
+    assert second.startswith(replies.STATUS_PAUSED)
+
+
+def test_w4_status_shows_this_months_spend_against_the_cap():
+    world = World(FakeGateway(cost=Decimal("0.25")), cap="5")
+
+    world.receive(
+        text_message("first question", message_id="wamid.1"),
+        text_message("second question", message_id="wamid.2"),
+        text_message("status", message_id="wamid.3"),
+    )
+
+    status = world.whatsapp.bodies[-1]
+    assert "November spend: $0.50 of $5.00 (10%)." in status
+    assert "- chat: $0.50 in 2 calls" in status
+    assert "Models used: small-model (2)" in status
+
+
+def test_w4_status_costs_nothing_and_never_calls_a_model():
+    world = World(cap="5")
+
+    world.receive(text_message("status"))
+
+    assert world.model.calls == []
+    assert "No model calls yet this month." in world.whatsapp.bodies[0]
+
+
+def test_r2_status_lists_the_providers_that_have_a_key_and_never_the_key():
+    world = World()
+
+    world.receive(text_message("status"))
+
+    status = world.whatsapp.bodies[0]
+    assert "Model keys: openrouter" in status
+    assert "sk-or-test" not in status
+
+
+def test_status_without_a_cap_says_so():
+    world = World()
+
+    world.receive(text_message("status"))
+
+    assert "No monthly cap is set." in world.whatsapp.bodies[0]
+
+
+# R4: the monthly cap, as the user sees it ----------------------------------------------
+
+
+def test_r4_the_user_is_warned_once_when_spend_passes_80_percent():
+    world = World(FakeGateway(cost=Decimal("0.45")), cap="1")
+
+    world.receive(
+        text_message("one", message_id="wamid.1"),  # 0.45
+        text_message("two", message_id="wamid.2"),  # 0.90: over 80%
+        text_message("status", message_id="wamid.3"),
+    )
+
+    bodies = world.whatsapp.bodies
+    assert bodies[0] == "Here is your answer."
+    assert bodies[1] == "Here is your answer."
+    assert bodies[2] == "Heads up: you have used $0.90 of your $1.00 monthly cap (90%)."
+    assert sum("Heads up" in body for body in bodies) == 1
+
+
+def test_r4_at_the_cap_paid_models_stop_and_the_user_is_told_what_still_works():
+    world = World(FakeGateway(cost=Decimal("0.60")), cap="1")
+
+    world.receive(
+        text_message("one", message_id="wamid.1"),  # 0.60
+        text_message("two", message_id="wamid.2"),  # 1.20: cap reached
+        text_message("three", message_id="wamid.3"),  # answered by the free model
+        text_message("help", message_id="wamid.4"),  # commands still work
+    )
+
+    bodies = world.whatsapp.bodies
+    assert "You have reached your monthly cap of $1.00." in bodies[2]
+    assert "Paid models are off until 1 December." in bodies[2]
+    assert "Commands still work" in bodies[2]
+    assert "free models" in bodies[2]
+    assert world.model.models == ["small-model", "small-model", "free-model"]
+    assert bodies[-1] == replies.HELP_REPLY
+    assert sum("reached your monthly cap" in body for body in bodies) == 1
 
 
 def test_w4_pause_stops_answers_and_resume_restarts_them():
-    world = World(FakeModel(answer="42"))
+    world = World(FakeGateway(answer="42"))
 
     world.receive(
         text_message("pause", message_id="wamid.1"),
@@ -250,7 +340,7 @@ def test_a_crash_while_handling_is_contained_and_logs_no_message_text(caplog):
             raise RuntimeError("database exploded while holding 'my secret message'")
 
     whatsapp = FakeWhatsApp()
-    broken = Assistant(BrokenStore(), whatsapp, FakeModel())
+    broken = Assistant(BrokenStore(), whatsapp, FakeGateway())
 
     with caplog.at_level("ERROR"):
         asyncio.run(broken.handle(text_message("my secret message")))

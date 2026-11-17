@@ -7,8 +7,9 @@ ever read as an instruction or shown to a model (W3).
 import asyncio
 import logging
 
-from tanios.llm import ModelClient, ModelError
-from tanios.store import Store, User
+from tanios.llm import ModelError
+from tanios.router import CHAT, BudgetExceeded, Router, money
+from tanios.store import Store, UsageSummary, User
 from tanios.whatsapp.client import WhatsAppClient, WhatsAppSendError
 from tanios.whatsapp.parsing import InboundMessage
 
@@ -29,10 +30,8 @@ HELP_REPLY = (
     "\n"
     "Anything else you send is answered as a question."
 )
-STATUS_ACTIVE_REPLY = "Tanios is active. Spend tracking is not switched on yet."
-STATUS_PAUSED_REPLY = (
-    "Tanios is paused. Send resume to start again. Spend tracking is not switched on yet."
-)
+STATUS_ACTIVE = "Tanios is active."
+STATUS_PAUSED = "Tanios is paused. Send resume to start again."
 PAUSE_REPLY = "Paused. I will not answer questions until you send resume."
 RESUME_REPLY = "Resumed. I am answering again."
 FORGET_REPLY = "There is nothing to forget yet: memory is not switched on."
@@ -49,6 +48,32 @@ SYSTEM_PROMPT = (
     "built. If the user asks for one of those, say plainly that it is not available yet. "
     "Never claim to have sent, saved, scheduled or remembered anything."
 )
+
+
+def format_status(user: User, month: str, usage: UsageSummary, key_names: list[str]) -> str:
+    """The reply to `status`: state, this month's spend against the cap, and what ran (W4)."""
+    lines = [STATUS_PAUSED if user.paused else STATUS_ACTIVE]
+
+    cap = user.monthly_cap_usd
+    if cap is None:
+        lines.append(f"{month} spend: {money(usage.total_usd)}. No monthly cap is set.")
+    else:
+        percent = int(usage.total_usd * 100 / cap) if cap > 0 else 100
+        lines.append(f"{month} spend: {money(usage.total_usd)} of {money(cap)} ({percent}%).")
+
+    if not usage.by_task:
+        lines.append("No model calls yet this month.")
+    for task, cost, calls in usage.by_task:
+        lines.append(f"- {task}: {money(cost)} in {calls} {'call' if calls == 1 else 'calls'}")
+    if usage.by_model:
+        used = ", ".join(f"{model} ({calls})" for model, calls in usage.by_model)
+        lines.append(f"Models used: {used}")
+
+    lines.append(f"Model keys: {', '.join(key_names) if key_names else 'none'}")
+    lines.append(
+        f"Free models for private content: {'on' if user.allow_free_for_private else 'off'}"
+    )
+    return "\n".join(lines)
 
 
 def parse_command(text: str) -> str | None:
@@ -68,13 +93,13 @@ class Assistant:
         self,
         store: Store,
         whatsapp: WhatsAppClient,
-        model: ModelClient,
+        router: Router,
         *,
         ack_after_seconds: float = 8.0,
     ) -> None:
         self._store = store
         self._whatsapp = whatsapp
-        self._model = model
+        self._router = router
         self._ack_after_seconds = ack_after_seconds
 
     async def handle(self, message: InboundMessage) -> None:
@@ -106,13 +131,15 @@ class Assistant:
         elif user.paused:
             await self._reply(message, PAUSED_REPLY)
         else:
-            await self._answer(message)
+            await self._answer(user, message)
 
     async def _run_command(self, command: str, user: User, message: InboundMessage) -> None:
         if command == "help":
             await self._reply(message, HELP_REPLY)
         elif command == "status":
-            await self._reply(message, STATUS_PAUSED_REPLY if user.paused else STATUS_ACTIVE_REPLY)
+            month, usage = await self._router.month_usage(user)
+            status = format_status(user, month, usage, self._router.key_names())
+            await self._reply(message, status)
         elif command == "pause":
             await self._store.set_paused(user.id, True)
             await self._reply(message, PAUSE_REPLY)
@@ -122,20 +149,27 @@ class Assistant:
         elif command == "forget":
             await self._reply(message, FORGET_REPLY)
 
-    async def _answer(self, message: InboundMessage) -> None:
+    async def _answer(self, user: User, message: InboundMessage) -> None:
         answer = asyncio.create_task(
-            self._model.complete(system=SYSTEM_PROMPT, user=message.text.strip())
+            self._router.complete(
+                user=user, task=CHAT, system=SYSTEM_PROMPT, prompt=message.text.strip()
+            )
         )
         finished, _ = await asyncio.wait({answer}, timeout=self._ack_after_seconds)
         if not finished:
             await self._reply(message, WORKING_REPLY)  # W1: within 10 seconds
         try:
             reply = await answer
+        except BudgetExceeded as stop:
+            await self._reply(message, str(stop))  # R4: say what still works
+            return
         except ModelError as error:
-            logger.warning("model call failed: %s", error)
+            logger.warning("no answer: %s", error)
             await self._reply(message, APOLOGY_REPLY)
             return
         await self._reply(message, reply.text)
+        if reply.notice:
+            await self._reply(message, reply.notice)
 
     async def _reply(self, message: InboundMessage, body: str) -> None:
         try:

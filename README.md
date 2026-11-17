@@ -8,6 +8,7 @@ model that can do each job.
 - Where the build stands: [docs/STATUS.md](docs/STATUS.md)
 - How to put it on a server: [docs/DEPLOY.md](docs/DEPLOY.md)
 - How to connect WhatsApp and a model: [docs/SETUP-WHATSAPP.md](docs/SETUP-WHATSAPP.md)
+- Models and your monthly budget: [docs/MODELS-AND-BUDGET.md](docs/MODELS-AND-BUDGET.md)
 
 ## Run it on your own computer
 
@@ -34,6 +35,7 @@ uv run pytest
 
 ```
 src/tanios/     the application
+config/         which models are used (models.toml)
 tests/          automated tests
 docs/           spec, status, deploy guide
 Dockerfile, docker-compose.yml, Caddyfile    the server setup

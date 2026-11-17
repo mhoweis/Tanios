@@ -10,6 +10,9 @@ services:
     environment:
       TANIOS_ENV: production
       TANIOS_DATABASE_URL: postgresql+asyncpg://tanios:${POSTGRES_PASSWORD}@db:5432/tanios
+    volumes:
+      # The models file. Edits here apply after: docker compose restart app
+      - ./config:/app/config:ro
     depends_on:
       db:
         condition: service_healthy
