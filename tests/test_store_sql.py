@@ -21,7 +21,10 @@ pytestmark = pytest.mark.skipif(
     not DATABASE_URL, reason="set TANIOS_TEST_DATABASE_URL to run against a real database"
 )
 
-TABLES = "users, strangers, processed_messages, usage_ledger"
+TABLES = (
+    "users, strangers, processed_messages, usage_ledger, "
+    "gmail_connections, gmail_links, emails, email_drafts"
+)
 
 
 async def owner(store: SqlStore, phone: str = "962790000001", cap: str | None = None, **kw):

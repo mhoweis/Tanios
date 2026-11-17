@@ -9,11 +9,14 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 
 from tanios.audio import AudioConverter, AudioError, wav_seconds
 from tanios.llm import ModelError
+from tanios.mail import Mailroom
+from tanios.mailtalk import MailRequest, parse_mail
 from tanios.memory import Forgotten, Memory, Note
-from tanios.router import CHAT, BudgetExceeded, Router, Task, money
+from tanios.router import CHAT, BudgetExceeded, Router, Task, money, utc_now
 from tanios.store import Store, UsageSummary, User
 from tanios.vault import VaultError
 from tanios.whatsapp.client import WhatsAppClient, WhatsAppSendError
@@ -39,6 +42,14 @@ HELP_REPLY = (
     "note: ... - put a quick note in your Inbox\n"
     "forget ... - remove something from memory\n"
     "\n"
+    "Email:\n"
+    "connect gmail / disconnect gmail\n"
+    "check mail - label new mail now\n"
+    "what's new? - list the mail that matters\n"
+    "draft a reply to 2 saying ... - write a reply as a Gmail draft\n"
+    "send / change: ... / cancel - act on a draft; nothing is sent without send\n"
+    "mail summary at 08:00 18:00 - get the list at set times (mail summary off to stop)\n"
+    "\n"
     "Anything else you send is answered as a question."
 )
 STATUS_ACTIVE = "Tanios is active."
@@ -55,6 +66,10 @@ NOTE_USAGE = "Tell me what to note, for example: note: call the bank about the t
 FORGET_USAGE = "Tell me which memory to forget, for example: forget my accountant"
 FORGET_NOTHING = "I found no memory matching that, so nothing was removed."
 NOTES_UNREACHABLE = "I could not reach your notes, so this answer does not use them."
+MAIL_OFF_REPLY = "Email is not set up on this server yet."
+SEND_TYPED_ONLY = (
+    "I do not send email from a voice note, in case I misheard. Type send to send the draft."
+)
 NOTES_LEFT_OUT = (
     "Your monthly cap is reached, so a free model answered without your notes or instructions."
 )
@@ -74,23 +89,43 @@ _STYLE = (
     "or tables. "
 )
 
-# Used while memory is off.
-SYSTEM_PROMPT = (
-    _STYLE + "Today you can only chat and answer questions, by text or voice note. "
-    "Handling email, remembering things between messages and saving files are still being "
-    "built. If the user asks for one of those, say plainly that it is not available yet. "
-    "Never claim to have sent, saved, scheduled or remembered anything."
+_NO_CLAIMS = "Never claim to have sent, saved, scheduled or remembered anything."
+_MEMORY_PART = (
+    "The user has a memory: notes kept in their own vault. The user saves to it by "
+    'starting a message with "remember" or "note:", and removes a memory with "forget". '
+    "You cannot save, change or delete notes yourself. If the user asks you to, tell them "
+    "which word to start their message with. "
+)
+_MAIL_PART = (
+    'The user can work on their Gmail with these commands: "check mail", "what\'s '
+    'new?", "draft a reply to 2 saying ...", then "send". You cannot read, write or send '
+    "email yourself in this chat. If the user asks for something with email, tell them "
+    "which command to use. "
 )
 
-# Used while memory is on.
-MEMORY_SYSTEM_PROMPT = (
-    _STYLE + "Today you can chat and answer questions, by text or voice note, and the user "
-    "has a memory: notes kept in their own vault. The user saves to it by starting a message "
-    'with "remember" or "note:", and removes a memory with "forget". You cannot save, '
-    "change or delete notes yourself. If the user asks you to, tell them which word to start "
-    "their message with. Handling email and saving files are still being built; say so "
-    "plainly if asked. Never claim to have sent, saved, scheduled or remembered anything."
-)
+
+def system_prompt(*, memory: bool, mail: bool) -> str:
+    """What the chat model is told about itself, matching what is switched on."""
+    text = _STYLE + "Today you can chat and answer questions, by text or voice note. "
+    text += _MEMORY_PART if memory else ""
+    text += _MAIL_PART if mail else ""
+    missing = [
+        name
+        for name, on in (
+            ("handling email", mail),
+            ("remembering things between messages", memory),
+            ("saving files", False),
+        )
+        if not on
+    ]
+    verb = "is" if len(missing) == 1 else "are"
+    listed = " and ".join(filter(None, [", ".join(missing[:-1]), missing[-1]]))
+    text += f"{listed.capitalize()} {verb} still being built; say so plainly if asked. "
+    return text + _NO_CLAIMS
+
+
+SYSTEM_PROMPT = system_prompt(memory=False, mail=False)
+MEMORY_SYSTEM_PROMPT = system_prompt(memory=True, mail=False)
 
 VOICE_ADDITION = (
     " The user sent a voice note and your reply will be read aloud. Use plain spoken "
@@ -298,7 +333,9 @@ class Assistant:
         *,
         audio: AudioConverter | None = None,
         memories: Callable[[int], Memory] | None = None,
+        mail: Mailroom | None = None,
         ack_after_seconds: float = 8.0,
+        now: Callable[[], datetime] = utc_now,
     ) -> None:
         self._audio = audio
         self._store = store
@@ -306,6 +343,9 @@ class Assistant:
         self._router = router
         # Gives each user their own vault. None means memory is off.
         self._memories = memories
+        # Gmail. None means email is off.
+        self._mail = mail
+        self._now = now
         # One change to a vault at a time, so two quick messages cannot pick the same name.
         self._vault_lock = asyncio.Lock()
         self._ack_after_seconds = ack_after_seconds
@@ -327,6 +367,8 @@ class Assistant:
             if await self._store.first_contact_from_stranger(message.sender_key):
                 await self._reply(message, STRANGER_REPLY)
             return
+        # WhatsApp lets Tanios write first only within 24 hours of this.
+        await self._store.note_message(user.id, self._now())
 
         if message.kind == "audio" and message.media_id:
             await self._voice_note(user, message)
@@ -347,6 +389,8 @@ class Assistant:
         elif command is not None:
             # Answered in text even when spoken: the reply is a list or figures to read.
             await self._run_command(command, user, message)
+        elif (mail := await self._mail_request(user, said)) is not None:
+            await self._do_mail(user, message, mail, spoken=spoken)
         elif user.paused:
             await self._reply(message, PAUSED_REPLY)
         elif (saving := parse_saving(said)) is not None:
@@ -360,6 +404,8 @@ class Assistant:
         elif command == "status":
             month, usage = await self._router.month_usage(user)
             status = format_status(user, month, usage, self._router.key_names())
+            if self._mail is not None:
+                status += "\n" + await self._mail.status_line(user)
             await self._reply(message, status)
         elif command == "pause":
             await self._store.set_paused(user.id, True)
@@ -367,6 +413,46 @@ class Assistant:
         elif command == "resume":
             await self._store.set_paused(user.id, False)
             await self._reply(message, RESUME_REPLY)
+
+    # Email (E1 to E6) -----------------------------------------------------------------
+
+    async def _mail_request(self, user: User, said: str) -> MailRequest | None:
+        request = parse_mail(said)
+        if request is None or request.certain:
+            return request
+        # "What's new?" is about mail only for someone who has connected Gmail.
+        if self._mail is not None and await self._mail.connected(user):
+            return request
+        return None
+
+    async def _do_mail(
+        self, user: User, message: InboundMessage, request: MailRequest, *, spoken: bool
+    ) -> None:
+        """Every mail reply is text: lists, drafts and recipients are for reading (W2)."""
+        mail = self._mail
+        if mail is None:
+            await self._reply(message, MAIL_OFF_REPLY)
+        elif request.kind == "disconnect":
+            # Taking access away is always allowed, paused or not.
+            await self._reply(message, await mail.disconnect(user))
+        elif user.paused:
+            await self._reply(message, PAUSED_REPLY)
+        elif request.kind == "send" and spoken:
+            await self._reply(message, SEND_TYPED_ONLY)
+        else:
+            work = {
+                "connect": lambda: mail.connect_link(user),
+                "check": lambda: mail.check_reply(user),
+                "news": lambda: mail.whats_new(user),
+                "digest": lambda: mail.set_digest(user, request.text),
+                "draft": lambda: mail.draft(
+                    user, request.number or 0, request.text, reply_all=request.reply_all
+                ),
+                "send": lambda: mail.send(user, request.number),
+                "change": lambda: mail.change(user, request.number, request.text),
+                "cancel": lambda: mail.cancel(user, request.number),
+            }[request.kind]
+            await self._reply(message, await self._with_ack(message, work()))
 
     # Memory (M2, M3, M7) --------------------------------------------------------------
 
@@ -428,7 +514,7 @@ class Assistant:
         self, user: User, message: InboundMessage, question: str, *, spoken: bool
     ) -> None:
         instructions, notes, unreachable = await self._recall(user, question)
-        system = SYSTEM_PROMPT if self._memories is None else MEMORY_SYSTEM_PROMPT
+        system = system_prompt(memory=self._memories is not None, mail=self._mail is not None)
         if spoken:
             system += VOICE_ADDITION
         afterwards: list[str] = [NOTES_UNREACHABLE] if unreachable else []

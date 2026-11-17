@@ -60,6 +60,21 @@ class Settings(BaseSettings):
     # Dates in note names and the daily log use this time zone, for example Asia/Amman.
     timezone: str = "UTC"
 
+    # Gmail (E1). All four must be set before email switches on. docs/SETUP-GMAIL.md
+    # says where each comes from.
+    domain: str | None = None  # the server's web address, as used for HTTPS
+    google_client_id: str | None = None
+    google_client_secret: SecretStr | None = None
+    # Encrypts the Google sign-in tokens kept in the database.
+    encryption_key: SecretStr | None = None
+    # Only for running on a developer machine: the address to use instead of
+    # https://<domain> in sign-in links.
+    public_url: str | None = None
+    gmail_api_base: str = "https://gmail.googleapis.com"
+    google_auth_url: str = "https://accounts.google.com/o/oauth2/v2/auth"
+    google_token_url: str = "https://oauth2.googleapis.com/token"
+    google_revoke_url: str = "https://oauth2.googleapis.com/revoke"
+
     @field_validator("*", mode="before")
     @classmethod
     def blank_means_unset(cls, value: object, info: ValidationInfo) -> object:
@@ -90,6 +105,22 @@ class Settings(BaseSettings):
             "TANIOS_WHATSAPP_PHONE_NUMBER_ID": self.whatsapp_phone_number_id,
             "TANIOS_OWNER_NUMBER": self.owner_number,
             "TANIOS_OPENROUTER_API_KEY": self.provider_keys(),
+        }
+        return [name for name, value in required.items() if not value]
+
+    def base_url(self) -> str | None:
+        """The address people reach this server at, without a trailing slash."""
+        if self.public_url:
+            return self.public_url.rstrip("/")
+        return f"https://{self.domain}" if self.domain else None
+
+    def missing_for_gmail(self) -> list[str]:
+        """Names of the settings still needed before email can work."""
+        required = {
+            "TANIOS_DOMAIN": self.base_url(),
+            "TANIOS_GOOGLE_CLIENT_ID": self.google_client_id,
+            "TANIOS_GOOGLE_CLIENT_SECRET": self.google_client_secret,
+            "TANIOS_ENCRYPTION_KEY": self.encryption_key,
         }
         return [name for name, value in required.items() if not value]
 

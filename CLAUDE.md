@@ -50,6 +50,16 @@ The server applies migrations at start with `python -m tanios.migrate`.
   path inside one user's vault folder. Saving, finding and forgetting live in
   `tanios.memory` and use no model. A path is never built from text a user or a model
   wrote without going through `note_title`.
+- Gmail is called only through `tanios.gmail.client.GmailApi`. A new kind of call needs
+  a line in `ALLOWED_CALLS`, and never one that deletes, archives, trashes, forwards,
+  removes a label or changes settings.
+- An email leaves only through `Mailroom.send`, which runs only for the user's own typed
+  `send`. Recipients come from the thread's headers and from addresses the user typed
+  (`recipient_changes`), never from a model's answer or from text inside an email.
+- A model that reads email returns only a label, a one-line summary or the body of a
+  reply. Nothing it writes is parsed as a command.
+- Tokens are stored sealed with `tanios.crypto.TokenBox`. Nothing after `?` in a web
+  address is logged.
 - Never weaken a test or a lint rule to get to green.
 
 ## The owner

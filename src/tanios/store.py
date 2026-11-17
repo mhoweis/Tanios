@@ -21,6 +21,8 @@ class User:
     allow_free_for_private: bool = False
     cap_warned_month: str | None = None
     cap_reached_month: str | None = None
+    # When they last wrote. WhatsApp only lets Tanios write first within 24 hours of it.
+    last_message_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,12 @@ class Store(Protocol):
         ...
 
     async def find_user(self, phone: str | None, wa_user_id: str | None) -> User | None: ...
+
+    async def user_by_id(self, user_id: int) -> User | None: ...
+
+    async def note_message(self, user_id: int, at: datetime) -> None:
+        """Record that this user wrote just now."""
+        ...
 
     async def first_contact_from_stranger(self, sender_key: str) -> bool:
         """True the first time an unregistered sender writes, False ever after."""
@@ -129,17 +137,15 @@ class SqlStore:
                     row.wa_user_id = wa_user_id
             elif wa_user_id:
                 row = await session.scalar(select(UserRow).where(UserRow.wa_user_id == wa_user_id))
-            if row is None:
-                return None
-            return User(
-                id=row.id,
-                phone=row.phone,
-                paused=row.paused,
-                monthly_cap_usd=row.monthly_cap_usd,
-                allow_free_for_private=row.allow_free_for_private,
-                cap_warned_month=row.cap_warned_month,
-                cap_reached_month=row.cap_reached_month,
-            )
+            return None if row is None else _user(row)
+
+    async def user_by_id(self, user_id: int) -> User | None:
+        async with self._sessions.begin() as session:
+            row = await session.get(UserRow, user_id)
+            return None if row is None else _user(row)
+
+    async def note_message(self, user_id: int, at: datetime) -> None:
+        await self._update_user(user_id, last_message_at=at)
 
     async def first_contact_from_stranger(self, sender_key: str) -> bool:
         statement = (
@@ -218,3 +224,16 @@ class SqlStore:
     async def _update_user(self, user_id: int, **values: object) -> None:
         async with self._sessions.begin() as session:
             await session.execute(update(UserRow).where(UserRow.id == user_id).values(**values))
+
+
+def _user(row: UserRow) -> User:
+    return User(
+        id=row.id,
+        phone=row.phone,
+        paused=row.paused,
+        monthly_cap_usd=row.monthly_cap_usd,
+        allow_free_for_private=row.allow_free_for_private,
+        cap_warned_month=row.cap_warned_month,
+        cap_reached_month=row.cap_reached_month,
+        last_message_at=row.last_message_at,
+    )
