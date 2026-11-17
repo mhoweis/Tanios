@@ -13,6 +13,8 @@ model that can do each job.
 - Memory and Obsidian: [docs/MEMORY.md](docs/MEMORY.md)
 - Email with Gmail: [docs/SETUP-GMAIL.md](docs/SETUP-GMAIL.md)
 - Saving files: [docs/FILES.md](docs/FILES.md)
+- Testers, the setup page and alerts: [docs/TESTERS.md](docs/TESTERS.md)
+- **Going live, step by step: [docs/GO-LIVE.md](docs/GO-LIVE.md)**
 
 ## Run it on your own computer
 

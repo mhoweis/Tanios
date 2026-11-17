@@ -23,7 +23,7 @@ pytestmark = pytest.mark.skipif(
 
 TABLES = (
     "users, strangers, processed_messages, usage_ledger, "
-    "gmail_connections, gmail_links, emails, email_drafts"
+    "gmail_connections, gmail_links, emails, email_drafts, user_keys, setup_tokens"
 )
 
 

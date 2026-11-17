@@ -63,6 +63,15 @@ The server applies migrations at start with `python -m tanios.migrate`.
   reply. Nothing it writes is parsed as a command.
 - Tokens are stored sealed with `tanios.crypto.TokenBox`. Nothing after `?` in a web
   address is logged.
+- Model keys come from `Router._keys_for(user)`. The server's own keys are the owner's;
+  a tester's calls use only the keys that tester added (U2). Keys are typed only on the
+  setup page, stored with `tanios.keys.SqlUserKeys`, and never shown, logged or sent.
+- Every table that holds something of a user's has a `user_id` that deletes with the
+  user (`ondelete="CASCADE"`), so `delete my data` cannot miss it.
+  `tests/test_testers_sql.py` checks every such table.
+- A message that reaches a user outside the 24-hour window is a template, sent by
+  `Mailroom._tell` with an `alert`. Its text is a fixed phrase with counts, never content
+  from an email or a note.
 - Never weaken a test or a lint rule to get to green.
 
 ## The owner

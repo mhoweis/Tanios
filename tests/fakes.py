@@ -29,6 +29,8 @@ class InMemoryStore:
         self.seen_messages: set[str] = set()
         self.strangers: set[str] = set()
         self.ledger: list[UsageEntry] = []
+        # Like the database's cascade: other stand-ins drop a deleted user's rows.
+        self.on_delete: list[Callable[[int], None]] = []
 
     def add_user(
         self,
@@ -38,8 +40,9 @@ class InMemoryStore:
         paused: bool = False,
         monthly_cap_usd: Decimal | str | None = None,
         allow_free_for_private: bool = False,
+        is_owner: bool = False,
     ) -> int:
-        user_id = len(self.users) + 1
+        user_id = max(self.users, default=0) + 1
         self.users[user_id] = {
             "phone": normalize_phone(phone),
             "wa_user_id": wa_user_id,
@@ -49,6 +52,8 @@ class InMemoryStore:
             "cap_warned_month": None,
             "cap_reached_month": None,
             "last_message_at": None,
+            "is_owner": is_owner,
+            "template_sent_at": None,
         }
         return user_id
 
@@ -65,8 +70,38 @@ class InMemoryStore:
                 user["allow_free_for_private"] = allow_free_for_private
                 return
         self.add_user(
-            phone, monthly_cap_usd=monthly_cap_usd, allow_free_for_private=allow_free_for_private
+            phone,
+            monthly_cap_usd=monthly_cap_usd,
+            allow_free_for_private=allow_free_for_private,
+            is_owner=True,
         )
+
+    async def add_tester(self, phone: str, monthly_cap_usd: Decimal | None) -> User | None:
+        if any(user["phone"] == normalize_phone(phone) for user in self.users.values()):
+            return None
+        return self.user(self.add_user(phone, monthly_cap_usd=monthly_cap_usd))
+
+    async def testers(self) -> list[User]:
+        return [self.user(i) for i in sorted(self.users) if not self.users[i]["is_owner"]]
+
+    async def delete_user(self, user_id: int) -> None:
+        self.users.pop(user_id, None)
+        self.ledger = [entry for entry in self.ledger if entry.user_id != user_id]
+        for hook in self.on_delete:
+            hook(user_id)
+
+    async def set_budget(
+        self, user_id: int, monthly_cap_usd: Decimal | None, allow_free_for_private: bool
+    ) -> None:
+        self.users[user_id].update(
+            monthly_cap_usd=monthly_cap_usd,
+            allow_free_for_private=allow_free_for_private,
+            cap_warned_month=None,
+            cap_reached_month=None,
+        )
+
+    async def mark_template(self, user_id: int, at: datetime) -> None:
+        self.users[user_id]["template_sent_at"] = at
 
     async def claim_message(self, wa_message_id: str) -> bool:
         if wa_message_id in self.seen_messages:
@@ -150,6 +185,7 @@ class FakeWhatsApp:
         self.media: dict[str, bytes] = {}
         self.downloads: list[str] = []
         self.voice_fails = False
+        self.templates: list[tuple[str | None, str, str, str]] = []  # to, name, language, text
 
     async def send_text(self, *, phone: str | None, wa_user_id: str | None, body: str) -> None:
         self.sent.append(SentMessage(phone, wa_user_id, body))
@@ -166,6 +202,11 @@ class FakeWhatsApp:
         if self.voice_fails:
             raise WhatsAppSendError("HTTP 500")
         self.voices.append((phone or wa_user_id, ogg))
+
+    async def send_template(
+        self, *, phone: str | None, wa_user_id: str | None, name: str, language: str, text: str
+    ) -> None:
+        self.templates.append((phone or wa_user_id, name, language, text))
 
     @property
     def bodies(self) -> list[str]:
@@ -186,7 +227,13 @@ class FakeSpeech:
 
     async def transcribe(self, *, provider, api_key, model, audio, audio_format, language):
         self.transcriptions.append(
-            {"model": model, "audio": audio, "format": audio_format, "language": language}
+            {
+                "model": model,
+                "audio": audio,
+                "format": audio_format,
+                "language": language,
+                "api_key": api_key,
+            }
         )
         if self.delay_seconds:
             await asyncio.sleep(self.delay_seconds)
@@ -769,3 +816,56 @@ def mail_model(
         return "Here is your answer."
 
     return answer
+
+
+# Keys and the setup page ---------------------------------------------------------------
+
+
+class InMemoryUserKeys:
+    def __init__(self, store: InMemoryStore | None = None) -> None:
+        self.keys: dict[int, dict[str, str]] = {}
+        if store is not None:
+            store.on_delete.append(lambda user_id: self.keys.pop(user_id, None))
+
+    async def keys_for(self, user_id: int) -> dict[str, str]:
+        return dict(self.keys.get(user_id, {}))
+
+    async def put(self, user_id: int, provider: str, key: str) -> None:
+        self.keys.setdefault(user_id, {})[provider.lower()] = key
+
+    async def remove(self, user_id: int, provider: str) -> None:
+        self.keys.get(user_id, {}).pop(provider.lower(), None)
+
+
+class InMemorySetupTokens:
+    def __init__(self, store: InMemoryStore | None = None) -> None:
+        self.rows: dict[str, dict] = {}
+        if store is not None:
+            store.on_delete.append(self._forget)
+
+    def _forget(self, user_id: int) -> None:
+        self.rows = {k: v for k, v in self.rows.items() if v["user_id"] != user_id}
+
+    async def add(self, hashed: str, user_id: int, kind: str, expires_at: datetime) -> None:
+        if kind == "link":
+            self.rows = {
+                k: v
+                for k, v in self.rows.items()
+                if not (v["user_id"] == user_id and v["kind"] == "link")
+            }
+        self.rows[hashed] = {"user_id": user_id, "kind": kind, "expires": expires_at, "used": False}
+
+    async def holder(self, hashed: str, kind: str, now: datetime) -> int | None:
+        row = self.rows.get(hashed)
+        if row is None or row["kind"] != kind or row["used"] or row["expires"] <= now:
+            return None
+        return row["user_id"]
+
+    async def use(self, hashed: str, kind: str, now: datetime) -> int | None:
+        user_id = await self.holder(hashed, kind, now)
+        if user_id is not None:
+            self.rows[hashed]["used"] = True
+        return user_id
+
+    async def end(self, hashed: str) -> None:
+        self.rows.pop(hashed, None)

@@ -428,11 +428,15 @@ def test_e2_mail_is_checked_every_hour_without_being_asked():
     assert world.labelled["m2"] == "Tanios/FYI"
 
 
-def test_e2_the_hourly_check_labels_quietly():
+def test_e2_w5_the_hourly_check_speaks_up_only_for_mail_that_needs_a_reply():
     world = World()
-    world.gmail.deliver(*FOUR)
+    world.gmail.deliver(*FOUR[1:])  # a statement, a newsletter, a suspicious mail
 
     assert world.tick() == []
+
+    world.gmail.deliver(FOUR[0])  # an invoice that needs an answer
+    world.later(hours=1, minutes=1)
+    assert world.tick() == ["1 new email needs a reply. Say what's new? for the list."]
 
 
 def test_e2_only_mail_from_the_day_before_connecting_onward_is_sorted():
@@ -696,7 +700,8 @@ def test_e3_summaries_can_be_switched_off_and_bad_times_are_explained():
 
     assert out[1].startswith("Mail summaries at set times are off.")
     assert out[2].startswith("Tell me the times in 24-hour form")
-    assert world.tick() == []
+    # With no summary times, only the hourly note about mail needing a reply (W5) comes.
+    assert world.tick() == ["1 new email needs a reply. Say what's new? for the list."]
 
 
 # E4: draft a reply, save it in Gmail, show it on WhatsApp ---------------------------------

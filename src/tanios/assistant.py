@@ -26,6 +26,7 @@ from tanios.llm import ModelError
 from tanios.mail import Mailroom
 from tanios.mailtalk import MailRequest, parse_mail
 from tanios.memory import Forgotten, Memory, Note
+from tanios.people import SETUP_OFF, PeopleRequest, Team, parse_people
 from tanios.router import CHAT, BudgetExceeded, Router, Task, money, utc_now
 from tanios.store import Store, UsageSummary, User
 from tanios.vault import VaultError
@@ -73,7 +74,16 @@ HELP_REPLY = (
     "send / change: ... / cancel - act on a draft; nothing is sent without send\n"
     "mail summary at 08:00 18:00 - get the list at set times (mail summary off to stop)\n"
     "\n"
+    "setup - your private page for keys, Gmail and budget\n"
+    "delete my data - remove everything the server holds about you\n"
+    "\n"
     "Anything else you send is answered as a question."
+)
+OWNER_HELP = (
+    "\n\nAs the owner:\n"
+    "invite +962 7x xxx xxxx - let a tester use Tanios\n"
+    "testers - list them\n"
+    "remove +962 7x xxx xxxx - remove a tester and delete their data"
 )
 STATUS_ACTIVE = "Tanios is active."
 STATUS_PAUSED = "Tanios is paused. Send resume to start again."
@@ -90,6 +100,11 @@ FORGET_USAGE = "Tell me which memory to forget, for example: forget my accountan
 FORGET_NOTHING = "I found no memory matching that, so nothing was removed."
 NOTES_UNREACHABLE = "I could not reach your notes, so this answer does not use them."
 MAIL_OFF_REPLY = "Email is not set up on this server yet."
+NEEDS_KEY_REPLY = (
+    "You have no model key yet, so I cannot answer. Send setup for your private setup page "
+    "and add one there. Never type a key into WhatsApp."
+)
+TYPE_IT_REPLY = "For safety, type that one instead of saying it."
 SEND_TYPED_ONLY = (
     "I do not send email from a voice note, in case I misheard. Type send to send the draft."
 )
@@ -359,6 +374,7 @@ class Assistant:
         audio: AudioConverter | None = None,
         memories: Callable[[int], Memory] | None = None,
         mail: Mailroom | None = None,
+        team: Team | None = None,
         ack_after_seconds: float = 8.0,
         max_file_bytes: int = 25 * 1024 * 1024,
         now: Callable[[], datetime] = utc_now,
@@ -375,6 +391,10 @@ class Assistant:
         self._memories = memories
         # Gmail. None means email is off.
         self._mail = mail
+        # Testers, the setup page and deleting data.
+        self._team = team
+        if team is not None:
+            team.forget_hooks.append(lambda user_id: self._waiting.pop(user_id, None))
         self._now = now
         # One change to a vault at a time, so two quick messages cannot pick the same name.
         self._vault_lock = asyncio.Lock()
@@ -422,6 +442,8 @@ class Assistant:
         elif command is not None:
             # Answered in text even when spoken: the reply is a list or figures to read.
             await self._run_command(command, user, message)
+        elif (people := parse_people(said)) is not None:
+            await self._people(user, message, people, spoken=spoken)
         elif (mail := await self._mail_request(user, said)) is not None:
             await self._do_mail(user, message, mail, spoken=spoken)
         elif user.paused:
@@ -435,10 +457,10 @@ class Assistant:
 
     async def _run_command(self, command: str, user: User, message: InboundMessage) -> None:
         if command == "help":
-            await self._reply(message, HELP_REPLY)
+            await self._reply(message, HELP_REPLY + (OWNER_HELP if user.is_owner else ""))
         elif command == "status":
             month, usage = await self._router.month_usage(user)
-            status = format_status(user, month, usage, self._router.key_names())
+            status = format_status(user, month, usage, await self._router.key_names_for(user))
             if self._mail is not None:
                 status += "\n" + await self._mail.status_line(user)
             await self._reply(message, status)
@@ -448,6 +470,20 @@ class Assistant:
         elif command == "resume":
             await self._store.set_paused(user.id, False)
             await self._reply(message, RESUME_REPLY)
+
+    # Testers and data (U1, U3) ---------------------------------------------------------
+
+    async def _people(
+        self, user: User, message: InboundMessage, request: PeopleRequest, *, spoken: bool
+    ) -> None:
+        """Always answered in text: links and warnings are for reading."""
+        if self._team is None:
+            await self._reply(message, SETUP_OFF)
+        elif spoken and request.kind in {"invite", "remove", "confirm_delete"}:
+            # Deleting data or letting someone in should not hang on a misheard word.
+            await self._reply(message, TYPE_IT_REPLY)
+        else:
+            await self._reply(message, await self._team.handle(user, request))
 
     # Email (E1 to E6) -----------------------------------------------------------------
 
@@ -640,6 +676,9 @@ class Assistant:
     async def _answer(
         self, user: User, message: InboundMessage, question: str, *, spoken: bool
     ) -> None:
+        if not await self._router.can_answer_for(user, CHAT):
+            await self._reply(message, NEEDS_KEY_REPLY)
+            return
         instructions, notes, unreachable = await self._recall(user, question)
         system = system_prompt(memory=self._memories is not None, mail=self._mail is not None)
         if spoken:
@@ -731,7 +770,7 @@ class Assistant:
     # Voice notes (W2) -----------------------------------------------------------------
 
     async def _voice_note(self, user: User, message: InboundMessage) -> None:
-        if self._audio is None or not self._router.voice_ready():
+        if self._audio is None or not await self._router.voice_ready_for(user):
             await self._reply(message, VOICE_OFF_REPLY)
             return
         if user.paused:

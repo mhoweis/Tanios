@@ -39,6 +39,12 @@ class WhatsAppClient(Protocol):
         """Send Ogg Opus audio so it arrives as a voice note."""
         ...
 
+    async def send_template(
+        self, *, phone: str | None, wa_user_id: str | None, name: str, language: str, text: str
+    ) -> None:
+        """W5: send an approved template with one text value, to reach someone first."""
+        ...
+
 
 def split_text(body: str, limit: int = MAX_TEXT_LENGTH) -> list[str]:
     """Break a long reply into parts WhatsApp accepts, at a paragraph or word when possible."""
@@ -156,6 +162,28 @@ class CloudApiClient:
         if response.status_code >= 400:
             raise WhatsAppSendError(f"HTTP {response.status_code}: {_error_summary(response)}")
         return response
+
+    async def send_template(
+        self, *, phone: str | None, wa_user_id: str | None, name: str, language: str, text: str
+    ) -> None:
+        if not phone and not wa_user_id:
+            raise WhatsAppSendError("no recipient")
+        recipient = {"to": phone} if phone else {"recipient": wa_user_id}
+        await self._post_message(
+            {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                **recipient,
+                "type": "template",
+                "template": {
+                    "name": name,
+                    "language": {"code": language},
+                    "components": [
+                        {"type": "body", "parameters": [{"type": "text", "text": text}]}
+                    ],
+                },
+            }
+        )
 
     async def _post_message(self, payload: dict) -> None:
         # A dropped connection gets one more try: a reply that arrives twice is better

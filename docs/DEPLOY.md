@@ -93,6 +93,33 @@ docker compose up -d --build
 
 ## Backups
 
-The database lives in a Docker volume named `tanios_db-data`. Until real data arrives
-in milestone 1 there is nothing to back up. A backup command is added with the first
-milestone that stores user data.
+Two things hold your data: the database (usage, drafts, sign-ins, keys) and the vaults
+(notes and saved files). This makes a copy of both in `/opt/tanios-backups`:
+
+```sh
+mkdir -p /opt/tanios-backups && cd /opt/tanios
+docker compose exec -T db pg_dump -U tanios tanios | gzip > /opt/tanios-backups/db-$(date +%F).sql.gz
+docker compose exec -T app tar czf - -C /vaults . > /opt/tanios-backups/vaults-$(date +%F).tgz
+ls -lh /opt/tanios-backups
+```
+
+Both files hold private data, and the database copy holds sign-ins and keys (stored
+encrypted, with the key in `.env`). Keep them on the server or somewhere as private.
+Copy `.env` somewhere safe too: without `TANIOS_ENCRYPTION_KEY` the stored sign-ins
+and keys cannot be opened, and everyone has to connect again.
+
+## Removing everything
+
+To delete Tanios and every piece of data it holds on this server:
+
+```sh
+cd /opt/tanios
+docker compose --profile sync down -v
+```
+
+The `-v` deletes the database and the vaults. It cannot be undone. Then remove Tanios's
+access in each Google account at https://myaccount.google.com/permissions, and delete
+the keys you made at OpenRouter and Meta.
+
+To remove only a tester, send `remove` and their number on WhatsApp instead (see
+[TESTERS.md](TESTERS.md)).
