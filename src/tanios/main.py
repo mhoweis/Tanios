@@ -12,6 +12,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Protocol
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import httpx2
@@ -27,11 +28,14 @@ from tanios.crypto import SealError, TokenBox
 from tanios.db import Database, DatabaseLike
 from tanios.gmail.client import GmailApi
 from tanios.gmail.oauth import GoogleOAuth
+from tanios.keys import SqlUserKeys
 from tanios.llm import ChatCompletionsGateway
 from tanios.mail import DRAFT, LABEL, Mailroom
 from tanios.mailstore import SqlMailStore
 from tanios.memory import Memories
+from tanios.people import Team
 from tanios.router import CHAT, Router
+from tanios.setup import COOKIE, SESSION_LIFETIME, SetupDesk, SqlSetupTokens, check_csrf, plain_page
 from tanios.speech import AudioApiGateway
 from tanios.store import SqlStore
 from tanios.vault import VaultError
@@ -96,6 +100,7 @@ def create_app(
     database: DatabaseLike | None = None,
     handler: MessageHandler | None = None,
     mailroom: MailDesk | None = None,
+    setup: SetupDesk | None = None,
 ) -> FastAPI:
     """Build the app. Tests pass their own settings, a stand-in database and handler."""
     settings = settings or get_settings()
@@ -115,6 +120,7 @@ def create_app(
         app.state.database = db
         app.state.handler = handler
         app.state.mailroom = mailroom
+        app.state.setup = setup
 
         http: httpx2.AsyncClient | None = None
         clock: asyncio.Task | None = None
@@ -122,7 +128,8 @@ def create_app(
         if handler is None and isinstance(db, Database) and not missing:
             http = httpx2.AsyncClient(timeout=httpx2.Timeout(60.0, connect=10.0))
             try:
-                app.state.handler, app.state.mailroom = await _build_assistant(settings, db, http)
+                built = await _build_assistant(settings, db, http)
+                app.state.handler, app.state.mailroom, app.state.setup = built
                 if app.state.mailroom is not None:
                     # E2: the hourly check, and summaries at the times the user set.
                     clock = asyncio.create_task(_mail_clock(app.state.mailroom))
@@ -233,6 +240,8 @@ def create_app(
             "and go back to WhatsApp.",
         )
 
+    _add_setup_routes(app, settings)
+
     @app.post("/webhooks/whatsapp")
     async def receive_webhook(request: Request, background: BackgroundTasks) -> dict[str, str]:
         """Every incoming WhatsApp message arrives here."""
@@ -263,6 +272,107 @@ def create_app(
     return app
 
 
+def _add_setup_routes(app: FastAPI, settings: Settings) -> None:
+    """The private setup page (U1). Every answer comes from SetupDesk; this is plumbing."""
+    auth = urlsplit(settings.google_auth_url)
+    google = f"{auth.scheme}://{auth.netloc}"
+    headers = {
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
+        "X-Frame-Options": "DENY",
+        "X-Content-Type-Options": "nosniff",
+        # No scripts at all; forms may only go to this server, or on to Google's sign-in.
+        "Content-Security-Policy": (
+            "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
+            f"frame-ancestors 'none'; form-action 'self' {google}"
+        ),
+    }
+
+    def html_page(body: str, code: int = 200) -> HTMLResponse:
+        return HTMLResponse(body, status_code=code, headers=headers)
+
+    def no_entry() -> HTMLResponse:
+        return html_page(
+            plain_page(
+                "This page has expired",
+                "Send setup to Tanios on WhatsApp for a new link. Links work once, for 15 "
+                "minutes, and a page stays open for 30.",
+            ),
+            status.HTTP_401_UNAUTHORIZED,
+        )
+
+    @app.get("/setup/open")
+    async def open_setup(t: str = Query("", max_length=200)) -> Response:
+        desk: SetupDesk | None = app.state.setup
+        session = await desk.open_link(t) if desk is not None and t else None
+        if session is None:
+            return no_entry()
+        # The one-time value leaves the address bar at once.
+        response = RedirectResponse("/setup", status.HTTP_303_SEE_OTHER, headers=headers)
+        response.set_cookie(
+            COOKIE,
+            session,
+            max_age=int(SESSION_LIFETIME.total_seconds()),
+            httponly=True,
+            secure=desk.secure,
+            samesite="strict",
+            path="/setup",
+        )
+        return response
+
+    @app.get("/setup")
+    async def show_setup(request: Request) -> Response:
+        desk: SetupDesk | None = app.state.setup
+        session = request.cookies.get(COOKIE, "")
+        user = await desk.session_user(session) if desk is not None else None
+        if user is None:
+            return no_entry()
+        return html_page(await desk.page(user, session))
+
+    @app.post("/setup/{action}")
+    @app.post("/setup/{action}/{detail}")
+    async def setup_form(request: Request, action: str, detail: str = "") -> Response:
+        desk: SetupDesk | None = app.state.setup
+        session = request.cookies.get(COOKIE, "")
+        user = await desk.session_user(session) if desk is not None else None
+        if user is None:
+            return no_entry()
+        form = await request.form()
+
+        def field(name: str) -> str:
+            value = form.get(name)
+            return value if isinstance(value, str) else ""
+
+        if not check_csrf(session, field("csrf")):
+            return html_page(plain_page("Not saved", "Please reload the page."), 403)
+        route = f"{action}/{detail}" if detail else action
+        if route == "keys":
+            outcome = await desk.save_key(user, field("provider"), field("key"))
+        elif route == "keys/remove":
+            outcome = await desk.remove_key(user, field("provider"))
+        elif route == "budget":
+            outcome = await desk.save_budget(user, field("cap"), field("free") == "yes")
+        elif route == "gmail/connect":
+            outcome = await desk.connect_gmail(user)
+        elif route == "gmail/disconnect":
+            outcome = await desk.disconnect_gmail(user)
+        elif route == "delete":
+            outcome = await desk.delete_everything(user, field("confirm"))
+        else:
+            return html_page(plain_page("Not found", "That page does not exist."), 404)
+
+        if outcome.redirect:
+            return RedirectResponse(outcome.redirect, status.HTTP_303_SEE_OTHER, headers=headers)
+        if outcome.ended:
+            await desk.end_session(session)
+            response = html_page(plain_page("Your data is deleted", outcome.message))
+            response.delete_cookie(COOKIE, path="/setup")
+            return response
+        # The user may have just been changed (budget), so read them again.
+        user = await desk.session_user(session)
+        return html_page(await desk.page(user, session, notice=outcome.message))
+
+
 async def _mail_clock(desk: MailDesk) -> None:
     while True:
         await desk.run_due()
@@ -271,15 +381,18 @@ async def _mail_clock(desk: MailDesk) -> None:
 
 async def _build_assistant(
     settings: Settings, database: Database, http: httpx2.AsyncClient
-) -> tuple[Assistant, Mailroom | None]:
+) -> tuple[Assistant, Mailroom | None, SetupDesk | None]:
     catalog = load_catalog(resolve_path(settings.models_file))
     store = SqlStore(database.sessions)
+    box = _open_box(settings)
+    user_keys = None if box is None else SqlUserKeys(database.sessions, box)
     router = Router(
         catalog,
         settings.provider_keys(),
         ChatCompletionsGateway(http),
         store,
         speech=AudioApiGateway(http),
+        user_keys=user_keys,
         max_tokens=settings.max_reply_tokens,
     )
     if not router.can_answer(CHAT):
@@ -301,6 +414,35 @@ async def _build_assistant(
         logger.warning("voice notes are off: no speech model can be reached")
     memories = await _open_memories(settings, store)
     mailroom = _open_mailroom(settings, database, http, store, router, whatsapp, memories)
+
+    setup = None
+    base_url = settings.base_url()
+    if user_keys is not None and base_url:
+        setup = SetupDesk(
+            tokens=SqlSetupTokens(database.sessions),
+            users=store,
+            keys=user_keys,
+            catalog=catalog,
+            public_url=base_url,
+            mail=mailroom,
+            memory_on=memories is not None,
+        )
+        logger.info("the setup page is on")
+    else:
+        logger.warning(
+            "the setup page and testers are off. Still to set: TANIOS_DOMAIN and "
+            "TANIOS_ENCRYPTION_KEY"
+        )
+    team = Team(
+        store=store,
+        memories=memories,
+        mail=mailroom,
+        setup=setup,
+        tester_cap_usd=settings.tester_cap_usd,
+    )
+    if setup is not None:
+        setup.team = team
+
     assistant = Assistant(
         store,
         whatsapp,
@@ -308,10 +450,22 @@ async def _build_assistant(
         audio=FfmpegConverter(),
         memories=memories,
         mail=mailroom,
+        team=team,
         ack_after_seconds=settings.ack_after_seconds,
         max_file_bytes=settings.max_file_mb * 1024 * 1024,
     )
-    return assistant, mailroom
+    return assistant, mailroom, setup
+
+
+def _open_box(settings: Settings) -> TokenBox | None:
+    """The lock for keys and tokens kept in the database. None until a key is set."""
+    if settings.encryption_key is None:
+        return None
+    try:
+        return TokenBox(settings.encryption_key.get_secret_value())
+    except SealError as error:
+        logger.error("keys and tokens cannot be stored: %s", error)
+        return None
 
 
 def _open_mailroom(
@@ -361,6 +515,11 @@ def _open_mailroom(
         timezone=ZoneInfo(settings.timezone),
         memories=memories,
         max_file_bytes=settings.max_file_mb * 1024 * 1024,
+        alert_template=(
+            (settings.whatsapp_alert_template, settings.whatsapp_template_language)
+            if settings.whatsapp_alert_template
+            else None
+        ),
     )
 
 

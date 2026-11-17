@@ -11,13 +11,13 @@ One line per milestone. Updated in the same pull request that changes it.
 | 4 Obsidian memory | Built, waiting for the owner's check | Owner follows docs/MEMORY.md and runs its eight checks. Sync with Obsidian has never run. |
 | 5 Gmail | Built, waiting for the owner's check | Owner follows docs/SETUP-GMAIL.md and runs its ten checks. Nothing has run against the real Google or Gmail services. |
 | 6 Files | Built, waiting for the owner's check | Owner runs the seven checks in docs/FILES.md. |
-| 7 Testers | Not started | |
+| 7 Testers | Built, waiting for the owner's check | Owner runs the eight checks in docs/TESTERS.md. docs/GO-LIVE.md gives the order for all milestones. |
 
-Milestones 1 to 6 were built at the owner's request before the owner's server checks
+Milestones 1 to 7 were built at the owner's request before the owner's server checks
 of the milestones before them. CI has built the Docker images and confirmed the app
-answers `/healthz`, but as of milestone 6 nothing has run against the real Meta,
-OpenRouter, Obsidian or Google services. The first live test covers seven milestones
-at once, so expect to find things. Milestone 5 is the first one that can send messages to
+answers `/healthz`, but as of milestone 7 nothing has run against the real Meta,
+OpenRouter, Obsidian or Google services. The first live test covers all eight
+milestones at once, so expect to find things. docs/GO-LIVE.md sets the order. Milestone 5 is the first one that can send messages to
 other people, so its checks matter most.
 
 ## What has been verified, and how
@@ -185,6 +185,77 @@ How the requirements are met, and where they stop short:
 - There is still no conversation history: each question stands on its own.
 - A blank line for a setting that has a default (for example `TANIOS_LOG_LEVEL=`) now
   means the default. Before this milestone it stopped the server from starting.
+
+### Milestone 7
+
+Requirements covered: U1 to U3, W5.
+
+- 802 automated tests pass, including the new tables against a real Postgres.
+- Breaking any of these on purpose makes tests fail (32 rules tried, 31 caught): a
+  tester never falling back to the owner's server keys, invites by the owner only, no
+  invites without the setup page, the tester limit, setup links working once and for 15
+  minutes, sessions ending after 30, the page's form check value, the cookie's
+  `HttpOnly` and `SameSite=Strict` flags, the page's limit on where forms may go,
+  escaping on the page, refusing text that is not a key and providers not in the models
+  file, the owner's budget staying in `.env`, the cap's bounds, typing DELETE on the
+  page, the 10-minute confirmation, refusing a spoken confirmation, the owner not
+  deleting themselves, revoking Gmail and deleting the vault on delete, never following
+  a link out of a vault while deleting it, one template per quiet stretch, templates
+  only for real alerts, templates only for mail that needs a reply or lost access, and
+  clearing a month's cap warnings when a new cap is set. The one rule not caught:
+  ending the page session after `delete my data` on the page. Deleting the user already
+  deletes that session through the database, so this is a second safeguard that
+  cannot fail on its own.
+- A database test lists every table with a `user_id` and checks that deleting a tester
+  leaves none of their rows in any of them, so a table added later cannot be missed.
+- The real server was run against Postgres with stand-in servers: an uninvited number
+  was turned away; the owner invited it; the tester was told to add a key; `setup` gave
+  a link that opened the page once and set a locked-down cookie; a form without the
+  page's check value was refused; the tester's key and a $3 cap were saved; the tester's
+  question went out with the tester's key and the owner's with the server's; `status`
+  showed the tester's own key and spend; after `delete my data` and the confirmation,
+  the tester's vault folder, key, page session and every database row were gone and the
+  page answered "expired". No key, link, check value or note text appeared in the log.
+- Not yet verified:
+  - **The template alert against the real Meta.** The message shape is from Meta's
+    documentation. Creating and approving the template, and the steps in
+    docs/TESTERS.md for it, have not been tried.
+  - The template path in the end-to-end run: it needs 25 quiet hours, so it was tested
+    with a stand-in clock only.
+  - The setup page on a phone browser, and Google's sign-in started from it.
+  - That Meta's test number accepts testers once added in the **To** box.
+
+How the requirements are met, and where they stop short:
+
+- **U1.** `invite +number` (owner only, up to 10 testers). WhatsApp does not let Tanios
+  write first, so the owner asks the tester to write. `setup` gives each user a
+  one-time link to a page where they add model keys, connect Gmail and set a budget.
+  The owner's budget stays in `.env`. Testers' vaults are not synced to Obsidian in
+  this version.
+- **U2.** Keys, spend, cap, Gmail, drafts, notes and files are kept per user, and a
+  tester's model calls use only that tester's keys. The person running the server can
+  still reach everything on it; the guide tells the owner to say so to testers.
+- **U3.** `delete my data`, confirmed within 10 minutes by typing `yes delete
+  everything`, or the delete button on the page. It cancels Gmail access at Google,
+  deletes the vault folder, and deletes the user, which removes every row of theirs.
+  The owner cannot delete themselves this way; `docs/DEPLOY.md` explains wiping the
+  server. Backups made before the deletion still hold the tester's data.
+- **W5.** One template alert per quiet stretch, when new mail needs a reply or Gmail
+  access was lost. It carries a count, never content. Within the 24-hour window the
+  same news comes as a plain message, except for users who chose set summary times.
+  Other news (digests, "Gmail is connected") is not sent by template.
+
+Readings of the spec that the owner should confirm or correct:
+
+- **Testers pay for their own models.** They use only keys they add, never the owner's.
+  Say so if you would rather they could use yours.
+- **"Something to report"** is read as: new mail that needs a reply, or lost Gmail
+  access. Nothing else triggers an alert.
+- **Inside the 24-hour window,** Tanios now tells you each hour when new mail needs a
+  reply. Before this milestone the hourly check was silent.
+
+Also in this milestone: `docs/DEPLOY.md` now has backup and wipe commands, which it had
+promised since milestone 0.
 
 ### Milestone 6
 

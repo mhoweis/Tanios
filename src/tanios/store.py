@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -23,6 +23,10 @@ class User:
     cap_reached_month: str | None = None
     # When they last wrote. WhatsApp only lets Tanios write first within 24 hours of it.
     last_message_at: datetime | None = None
+    # The owner runs the server and may invite testers. Server-wide keys are the owner's.
+    is_owner: bool = False
+    # W5: when a template message last went out to them.
+    template_sent_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -60,7 +64,25 @@ class Store(Protocol):
 
     async def ensure_owner(
         self, phone: str, *, monthly_cap_usd: Decimal | None, allow_free_for_private: bool
+    ) -> None:
+        """Make sure the owner exists, with the budget from the server settings."""
+        ...
+
+    async def add_tester(self, phone: str, monthly_cap_usd: Decimal | None) -> User | None:
+        """Register a number (U1). None if that number is already registered."""
+        ...
+
+    async def testers(self) -> list[User]: ...
+
+    async def delete_user(self, user_id: int) -> None:
+        """Remove a user and every row that belongs to them (U3)."""
+        ...
+
+    async def set_budget(
+        self, user_id: int, monthly_cap_usd: Decimal | None, allow_free_for_private: bool
     ) -> None: ...
+
+    async def mark_template(self, user_id: int, at: datetime) -> None: ...
 
     async def claim_message(self, wa_message_id: str) -> bool:
         """True the first time a message ID is seen, False for a repeat."""
@@ -98,8 +120,8 @@ class SqlStore:
     async def ensure_owner(
         self, phone: str, *, monthly_cap_usd: Decimal | None, allow_free_for_private: bool
     ) -> None:
-        # Until the setup page exists (milestone 7), the owner's budget comes from the
-        # server settings, so it is refreshed on every start.
+        # The owner's budget lives in the server settings (.env), so it is refreshed on
+        # every start. Testers set theirs on their setup page.
         budget = {
             "monthly_cap_usd": monthly_cap_usd,
             "allow_free_for_private": allow_free_for_private,
@@ -113,6 +135,45 @@ class SqlStore:
         )
         async with self._sessions.begin() as session:
             await session.execute(statement)
+
+    async def add_tester(self, phone: str, monthly_cap_usd: Decimal | None) -> User | None:
+        statement = (
+            insert(UserRow)
+            .values(phone=normalize_phone(phone), is_owner=False, monthly_cap_usd=monthly_cap_usd)
+            .on_conflict_do_nothing()
+            .returning(UserRow.id)
+        )
+        async with self._sessions.begin() as session:
+            user_id = await session.scalar(statement)
+            if user_id is None:
+                return None
+            return _user(await session.get(UserRow, user_id))
+
+    async def testers(self) -> list[User]:
+        statement = select(UserRow).where(UserRow.is_owner.is_(False)).order_by(UserRow.id)
+        async with self._sessions.begin() as session:
+            return [_user(row) for row in await session.scalars(statement)]
+
+    async def delete_user(self, user_id: int) -> None:
+        # Every table that holds something of a user's points at this row and is set
+        # to delete with it.
+        async with self._sessions.begin() as session:
+            await session.execute(delete(UserRow).where(UserRow.id == user_id))
+
+    async def set_budget(
+        self, user_id: int, monthly_cap_usd: Decimal | None, allow_free_for_private: bool
+    ) -> None:
+        # A new cap gets its own warnings, so the "already told" marks are cleared.
+        await self._update_user(
+            user_id,
+            monthly_cap_usd=monthly_cap_usd,
+            allow_free_for_private=allow_free_for_private,
+            cap_warned_month=None,
+            cap_reached_month=None,
+        )
+
+    async def mark_template(self, user_id: int, at: datetime) -> None:
+        await self._update_user(user_id, template_sent_at=at)
 
     async def claim_message(self, wa_message_id: str) -> bool:
         statement = (
@@ -236,4 +297,6 @@ def _user(row: UserRow) -> User:
         cap_warned_month=row.cap_warned_month,
         cap_reached_month=row.cap_reached_month,
         last_message_at=row.last_message_at,
+        is_owner=row.is_owner,
+        template_sent_at=row.template_sent_at,
     )

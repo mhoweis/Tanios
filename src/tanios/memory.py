@@ -127,6 +127,10 @@ class Memory:
 
     # M1: the layout -------------------------------------------------------------------
 
+    def destroy(self) -> bool:
+        """U3: delete this user's whole vault on the server."""
+        return self._vault.destroy()
+
     def ensure_layout(self) -> None:
         """Create the folders and starter notes that are missing. Never overwrites."""
         for folder in FOLDERS:

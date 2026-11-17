@@ -347,8 +347,11 @@ class Mailroom:
         timezone: tzinfo,
         memories: Callable[[int], Memory] | None = None,
         max_file_bytes: int = 25 * 1024 * 1024,
+        alert_template: tuple[str, str] | None = None,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
+        # W5: the approved template's name and language, or None when none is set up.
+        self._alert_template = alert_template
         self._max_file_bytes = max_file_bytes
         self._store = store
         self._users = users
@@ -413,19 +416,63 @@ class Mailroom:
         except VaultError:
             return ""
 
-    async def _tell(self, user: User, text: str) -> bool:
-        """Write to the user first. Only possible within 24 hours of their last message."""
+    def _outside_window(self, user: User) -> bool:
         last = user.last_message_at
-        if last is None or self._now() - last > WHATSAPP_WINDOW:
+        return last is None or self._now() - last > WHATSAPP_WINDOW
+
+    async def _tell(self, user: User, text: str, *, alert: str | None = None) -> bool:
+        """Write to the user first.
+
+        Within 24 hours of their last message this is ordinary text. After that WhatsApp
+        only accepts an approved template (W5): with `alert` given and a template set up,
+        one template goes out, and no other until the user writes again.
+        """
+        last = user.last_message_at
+        if last is not None and self._now() - last <= WHATSAPP_WINDOW:
+            try:
+                await self._whatsapp.send_text(phone=user.phone, wa_user_id=None, body=text)
+            except WhatsAppSendError as error:
+                logger.warning("could not send a mail notice: %s", error)
+                return False
+            return True
+        if alert is None or self._alert_template is None:
             return False
+        sent = user.template_sent_at
+        if sent is not None and (last is None or sent >= last):
+            return False  # one template per silence: they have not answered the last one
+        name, language = self._alert_template
         try:
-            await self._whatsapp.send_text(phone=user.phone, wa_user_id=None, body=text)
+            await self._whatsapp.send_template(
+                phone=user.phone, wa_user_id=None, name=name, language=language, text=alert
+            )
         except WhatsAppSendError as error:
-            logger.warning("could not send a mail notice: %s", error)
+            logger.warning("could not send a template alert: %s", error)
             return False
+        await self._users.mark_template(user.id, self._now())
+        await self._log(user.id, f"Sent a WhatsApp alert: {alert}")
         return True
 
     # E1: connect and disconnect --------------------------------------------------------
+
+    async def consent_for(self, user: User) -> str:
+        """For the setup page: a fresh one-time sign-in, straight to Google's page."""
+        token = secrets.token_urlsafe(32)
+        await self._store.add_link(link_hash(token), user.id, self._now() + LINK_LIFETIME)
+        return self._oauth.consent_url(token)
+
+    async def remove_user(self, user: User) -> bool:
+        """U3: cancel the Google access and forget it. False if Google could not be reached."""
+        connection = await self._store.connection(user.id)
+        self._access.pop(user.id, None)
+        if connection is None:
+            return True
+        try:
+            await self._oauth.revoke(self._box.open(connection.sealed_token))
+            revoked = True
+        except (GmailError, SealError):
+            revoked = False
+        await self._store.drop_connection(user.id)
+        return revoked
 
     async def connect_link(self, user: User) -> str:
         token = secrets.token_urlsafe(32)
@@ -725,12 +772,24 @@ class Mailroom:
         checked = connection.last_checked_at
         if checked is None or now - checked >= CHECK_EVERY:
             try:
-                await self.check(user, connection)
+                result = await self.check(user, connection)
             except GmailAuthError:
-                await self._tell(user, await self._lose(user.id))
+                await self._tell(user, await self._lose(user.id), alert="Gmail was disconnected")
                 return
             except GmailError as error:
                 logger.warning("hourly mail check failed: %s", error)
+            else:
+                # W5: mail that needs an answer is worth reaching the user for.
+                waiting = result.counts.get("needs_reply", 0)
+                # Someone who chose set summary times hears about it then, not every hour,
+                # unless they have been silent too long for a summary to reach them.
+                if waiting and (not connection.digest_times or self._outside_window(user)):
+                    noun = "email needs" if waiting == 1 else "emails need"
+                    await self._tell(
+                        user,
+                        f"{waiting} new {noun} a reply. Say what's new? for the list.",
+                        alert=f"{waiting} new {noun} a reply",
+                    )
 
         local = now.astimezone(self._timezone)
         for time in connection.digest_times:

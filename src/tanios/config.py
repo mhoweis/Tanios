@@ -60,6 +60,13 @@ class Settings(BaseSettings):
     # Dates in note names and the daily log use this time zone, for example Asia/Amman.
     timezone: str = "UTC"
 
+    # W5: the name of the approved WhatsApp template used to reach a user who has been
+    # silent for over 24 hours, and its language code. Unset means no alerts then.
+    whatsapp_alert_template: str | None = None
+    whatsapp_template_language: str = "en"
+    # U1: the monthly cap a new tester starts with. They can change it on their page.
+    tester_cap_usd: Decimal | None = Field(default=Decimal("5"), ge=0)
+
     # M6: the largest file Tanios will save, in megabytes. Obsidian Sync has its own
     # limit per file, which depends on the plan.
     max_file_mb: int = Field(default=25, ge=1, le=100)

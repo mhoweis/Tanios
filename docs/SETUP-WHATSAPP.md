@@ -146,5 +146,6 @@ When all six pass, milestone 1 is done. The checks for milestone 2 are at the en
 
 - Tanios does not remember earlier messages yet. Each question is answered alone.
   Memory arrives in milestone 4.
-- Meta's test number is for trying things out. Moving to a number of your own is a
-  later step and comes with its own guide.
+- Meta's test number is for trying things out. It only talks to the few numbers added
+  in its **To** box, so each tester must be added there too (see
+  [TESTERS.md](TESTERS.md)). Moving to a number of your own is a later step.

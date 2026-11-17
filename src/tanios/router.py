@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from tanios.catalog import ESCALATION, Catalog, ModelEntry, SpeechEntry
+from tanios.keys import UserKeys
 from tanios.llm import ModelError, ModelGateway, ModelReply
 from tanios.speech import SpeechGateway
 from tanios.store import Store, UsageEntry, UsageSummary, User
@@ -104,9 +105,13 @@ class Router:
         store: Store,
         *,
         speech: SpeechGateway | None = None,
+        user_keys: UserKeys | None = None,
         max_tokens: int = 700,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
+        # Keys users added themselves. With this set, the server's own keys are the
+        # owner's alone: a tester's calls only ever use the tester's keys (U2).
+        self._user_keys = user_keys
         self._speech = speech
         self._catalog = catalog
         self._keys = {name.lower(): key for name, key in keys.items() if key}
@@ -136,6 +141,43 @@ class Router:
             entry.provider in self._keys for entry in self._catalog.transcribers
         )
 
+    # The same questions for one user, with the keys that user may use ------------------
+
+    async def _keys_for(self, user: User) -> dict[str, str]:
+        if self._user_keys is None:
+            return self._keys
+        own = {
+            name.lower(): key
+            for name, key in (await self._user_keys.keys_for(user.id)).items()
+            if key and name.lower() in self._catalog.providers
+        }
+        # A user's own key for a provider is used in place of the server's.
+        return {**self._keys, **own} if user.is_owner else own
+
+    async def key_names_for(self, user: User) -> list[str]:
+        """R2: the providers this user has a key for, marking the ones they added."""
+        own = set() if self._user_keys is None else set(await self._user_keys.keys_for(user.id))
+        names = []
+        for name in sorted(await self._keys_for(user)):
+            if name in self._catalog.providers:
+                names.append(f"{name} (added by you)" if name in own else name)
+        return names
+
+    async def can_answer_for(self, user: User, task: Task) -> bool:
+        keys = await self._keys_for(user)
+        start = self._start_index(self._catalog.tier_for(task.name))
+        return any(
+            entry.provider in keys
+            for tier in ESCALATION[start:]
+            for entry in self._catalog.tiers.get(tier, ())
+        )
+
+    async def voice_ready_for(self, user: User) -> bool:
+        keys = await self._keys_for(user)
+        return self._speech is not None and any(
+            entry.provider in keys for entry in self._catalog.transcribers
+        )
+
     async def month_usage(self, user: User) -> tuple[str, UsageSummary]:
         now = self._now()
         return f"{now:%B}", await self._store.usage_summary(user.id, start_of_month(now))
@@ -158,8 +200,9 @@ class Router:
         over_cap = cap is not None and spent_before >= cap
 
         # Over the cap, only free models are left, wherever in the tiers they sit.
+        keys = await self._keys_for(user)
         start = 0 if over_cap else self._start_index(self._catalog.tier_for(task.name))
-        choice = self._pick(start, task, user, paid_allowed=not over_cap)
+        choice = self._pick(start, task, user, keys, paid_allowed=not over_cap)
         if choice is None:
             if over_cap:
                 if user.cap_reached_month != month:
@@ -167,20 +210,22 @@ class Router:
                 raise BudgetExceeded(self._cap_reached_text(cap, now, free_left=False))
             raise NoModelAvailable("no model can be reached for this task")
 
-        reply, cost, ok = await self._attempt(choice, user, task, system, prompt, check, now)
+        reply, cost, ok = await self._attempt(choice, user, task, system, prompt, check, now, keys)
         spent_after = spent_before + cost
         retried = False
 
         if not ok:
             # R5: one retry, one tier up, never more.
             higher = self._pick(
-                ESCALATION.index(choice.tier) + 1, task, user, paid_allowed=not over_cap
+                ESCALATION.index(choice.tier) + 1, task, user, keys, paid_allowed=not over_cap
             )
             if higher is None:
                 raise ModelError("no usable answer, and no higher tier to retry on")
             retried = True
             choice = higher
-            reply, cost, ok = await self._attempt(choice, user, task, system, prompt, check, now)
+            reply, cost, ok = await self._attempt(
+                choice, user, task, system, prompt, check, now, keys
+            )
             spent_after += cost
             if not ok:
                 raise ModelError("no usable answer after one retry")
@@ -197,11 +242,12 @@ class Router:
     ) -> str:
         """A voice note as text. Raises BudgetExceeded over the cap, ModelError on failure."""
         now = self._now()
-        entry = await self._pick_speech(self._catalog.transcribers, user, now)
+        keys = await self._keys_for(user)
+        entry = await self._pick_speech(self._catalog.transcribers, user, now, keys)
         try:
             transcript = await self._speech.transcribe(
                 provider=self._catalog.providers[entry.provider],
-                api_key=self._keys[entry.provider],
+                api_key=keys[entry.provider],
                 model=entry.model,
                 audio=audio,
                 audio_format=audio_format,
@@ -220,11 +266,12 @@ class Router:
     async def speak(self, *, user: User, text: str) -> SpokenAudio:
         """An answer as audio. Raises BudgetExceeded over the cap, ModelError on failure."""
         now = self._now()
-        entry = await self._pick_speech(self._catalog.speakers, user, now)
+        keys = await self._keys_for(user)
+        entry = await self._pick_speech(self._catalog.speakers, user, now, keys)
         try:
             data = await self._speech.speak(
                 provider=self._catalog.providers[entry.provider],
-                api_key=self._keys[entry.provider],
+                api_key=keys[entry.provider],
                 model=entry.model,
                 voice=entry.voice,
                 text=text,
@@ -241,7 +288,7 @@ class Router:
         return SpokenAudio(data=data, format=entry.format)
 
     async def _pick_speech(
-        self, entries: tuple[SpeechEntry, ...], user: User, now: datetime
+        self, entries: tuple[SpeechEntry, ...], user: User, now: datetime, keys: Mapping[str, str]
     ) -> SpeechEntry:
         if self._speech is None:
             raise NoModelAvailable("speech is not set up")
@@ -250,7 +297,7 @@ class Router:
             cap is not None and await self._store.spend_since(user.id, start_of_month(now)) >= cap
         )
         for entry in entries:
-            if entry.provider in self._keys and (entry.free or not over_cap):
+            if entry.provider in keys and (entry.free or not over_cap):
                 return entry
         if over_cap:
             raise BudgetExceeded(
@@ -301,17 +348,19 @@ class Router:
             raise NoModelAvailable(f"tier '{tier}' cannot be used for text answers")
         return ESCALATION.index(tier)
 
-    def _pick(self, start: int, task: Task, user: User, *, paid_allowed: bool) -> _Choice | None:
+    def _pick(
+        self, start: int, task: Task, user: User, keys: Mapping[str, str], *, paid_allowed: bool
+    ) -> _Choice | None:
         """The first usable model, searching from tier `start` upward."""
         for tier in ESCALATION[start:]:
             for entry in self._catalog.tiers.get(tier, ()):
-                if self._usable(entry, task, user, paid_allowed=paid_allowed):
+                if entry.provider in keys and self._usable(
+                    entry, task, user, paid_allowed=paid_allowed
+                ):
                     return _Choice(tier, entry)
         return None
 
     def _usable(self, entry: ModelEntry, task: Task, user: User, *, paid_allowed: bool) -> bool:
-        if entry.provider not in self._keys:
-            return False
         if entry.free:
             # R3: private content stays away from free models unless the user allows it.
             return not task.private or user.allow_free_for_private
@@ -328,13 +377,14 @@ class Router:
         prompt: str,
         check: Check,
         now: datetime,
+        keys: Mapping[str, str],
     ) -> tuple[ModelReply | None, Decimal, bool]:
         entry = choice.entry
         reply: ModelReply | None = None
         try:
             reply = await self._gateway.call(
                 provider=self._catalog.providers[entry.provider],
-                api_key=self._keys[entry.provider],
+                api_key=keys[entry.provider],
                 model=entry.model,
                 system=system,
                 user=prompt,
@@ -400,7 +450,8 @@ class Router:
             if user.cap_reached_month == month:
                 return None
             await self._store.mark_cap_reached(user.id, month)
-            free_left = self._pick(0, task, user, paid_allowed=False) is not None
+            keys = await self._keys_for(user)
+            free_left = self._pick(0, task, user, keys, paid_allowed=False) is not None
             return self._cap_reached_text(cap, now, free_left=free_left)
         if spent >= cap * WARN_AT and user.cap_warned_month != month:
             await self._store.mark_cap_warned(user.id, month)

@@ -7,6 +7,7 @@ Tanios only ever touches files inside the folder it is given (M1).
 import contextlib
 import os
 import secrets
+import shutil
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
@@ -41,6 +42,23 @@ class Vault(Protocol):
 class FolderVault:
     def __init__(self, root: Path) -> None:
         self._root = root
+
+    def destroy(self) -> bool:
+        """Delete the whole vault folder (U3). False when there was nothing to delete.
+
+        A vault folder that is itself a link is unlinked, never followed, so this can
+        only ever remove the folder Tanios made.
+        """
+        try:
+            if self._root.is_symlink():
+                self._root.unlink()
+                return True
+            if not self._root.exists():
+                return False
+            shutil.rmtree(self._root)
+        except OSError:
+            raise VaultError("vault could not be deleted") from None
+        return True
 
     def _resolve(self, path: str) -> Path:
         """Turn a vault-relative path into a real one, refusing anything outside the vault."""

@@ -47,6 +47,8 @@ class UserRow(Base):
     cap_reached_month: Mapped[str | None] = mapped_column(String(7))
     # When this user last wrote. WhatsApp lets Tanios write first only within 24 hours of it.
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # W5: when a template message last went out. One per stretch of silence.
+    template_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -167,3 +169,28 @@ class EmailDraftRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class UserKeyRow(Base):
+    """A model key a user added on their setup page (R2). Stored encrypted."""
+
+    __tablename__ = "user_keys"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    provider: Mapped[str] = mapped_column(String(64), primary_key=True)
+    sealed_key: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class SetupTokenRow(Base):
+    """A one-time link to the setup page, or a short session on it. Only hashes are kept."""
+
+    __tablename__ = "setup_tokens"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(16))  # "link" or "session"
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
