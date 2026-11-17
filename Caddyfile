@@ -1,0 +1,5 @@
+# Caddy gets and renews the HTTPS certificate for this domain by itself.
+{$TANIOS_DOMAIN} {
+	encode gzip
+	reverse_proxy app:8000
+}
