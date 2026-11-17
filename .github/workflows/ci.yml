@@ -56,3 +56,21 @@ jobs:
           exit 1
       - name: The image can encode WhatsApp voice notes
         run: docker run --rm tanios sh -c "ffmpeg -hide_banner -encoders | grep libopus"
+      - name: The vault-sync image builds and Obsidian Headless runs
+        run: |
+          docker build -t tanios-vault-sync docker/vault-sync
+          docker run --rm tanios-vault-sync ob --version
+          docker run --rm tanios-vault-sync ob sync --help
+      - name: The app and vault-sync can both write the same vault folder
+        run: |
+          docker volume create vault-check
+          docker run --rm -v vault-check:/vaults tanios sh -c "mkdir /vaults/user-1 && echo from-app > /vaults/user-1/note.md"
+          docker run --rm -v vault-check:/vaults tanios-vault-sync sh -c "echo from-sync >> /vaults/user-1/note.md"
+          docker run --rm -v vault-check:/vaults tanios sh -c "echo from-app-again >> /vaults/user-1/note.md && cat /vaults/user-1/note.md" | tee /tmp/note.txt
+          test "$(wc -l < /tmp/note.txt)" = "3"
+      - name: The compose file is valid with and without vault sync
+        run: |
+          cp .env.example .env
+          sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=ci/" .env
+          docker compose config --quiet
+          docker compose --profile sync config --quiet

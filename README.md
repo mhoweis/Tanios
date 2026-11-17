@@ -10,6 +10,7 @@ model that can do each job.
 - How to connect WhatsApp and a model: [docs/SETUP-WHATSAPP.md](docs/SETUP-WHATSAPP.md)
 - Models and your monthly budget: [docs/MODELS-AND-BUDGET.md](docs/MODELS-AND-BUDGET.md)
 - Voice notes: [docs/VOICE-NOTES.md](docs/VOICE-NOTES.md)
+- Memory and Obsidian: [docs/MEMORY.md](docs/MEMORY.md)
 
 ## Run it on your own computer
 
@@ -23,7 +24,8 @@ uv run uvicorn tanios.main:create_app --factory --reload
 
 Then open http://127.0.0.1:8000/healthz. Without a database configured, `/healthz`
 answers `ok` and `/readyz` answers `not ready`; that is expected. WhatsApp chat stays
-off until every setting in `.env.example` is filled in.
+off until every setting in `.env.example` is filled in. Memory stays off until
+`TANIOS_VAULTS_DIR` names a folder for the vaults.
 
 ## Check the code
 
@@ -40,5 +42,6 @@ src/tanios/     the application
 config/         which models are used (models.toml)
 tests/          automated tests
 docs/           spec, status, deploy guide
+docker/         the vault-sync container (Obsidian Headless)
 Dockerfile, docker-compose.yml, Caddyfile    the server setup
 ```

@@ -322,12 +322,16 @@ def test_w4_pause_stops_answers_and_resume_restarts_them():
     assert world.model.prompts == ["what is 6 x 7?"]
 
 
-def test_w4_forget_is_understood_and_honest_that_memory_is_not_built_yet():
+def test_w4_forget_is_understood_and_honest_when_memory_is_not_set_up():
     world = World()
 
-    world.receive(text_message("forget my accountant"))
+    world.receive(
+        text_message("forget my accountant", message_id="wamid.1"),
+        text_message("remember my accountant is Rana", message_id="wamid.2"),
+        text_message("note: call the bank", message_id="wamid.3"),
+    )
 
-    assert world.whatsapp.bodies == [replies.FORGET_REPLY]
+    assert world.whatsapp.bodies == [replies.MEMORY_OFF_REPLY] * 3
     assert world.model.prompts == []
 
 

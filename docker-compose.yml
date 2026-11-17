@@ -10,9 +10,12 @@ services:
     environment:
       TANIOS_ENV: production
       TANIOS_DATABASE_URL: postgresql+asyncpg://tanios:${POSTGRES_PASSWORD}@db:5432/tanios
+      TANIOS_VAULTS_DIR: /vaults
     volumes:
       # The models file. Edits here apply after: docker compose restart app
       - ./config:/app/config:ro
+      # Tanios's notes: one Obsidian vault per user (see docs/MEMORY.md).
+      - vault-data:/vaults
     depends_on:
       db:
         condition: service_healthy
@@ -59,7 +62,21 @@ services:
     depends_on:
       - app
 
+  # Keeps the owner's Tanios vault in step with Obsidian Sync. It only starts once it has
+  # been set up, which docs/MEMORY.md walks through. It holds the Obsidian sign-in in its
+  # own volume and is given none of the settings in .env.
+  vault-sync:
+    profiles: ["sync"]
+    build: ./docker/vault-sync
+    restart: unless-stopped
+    volumes:
+      - vault-data:/vaults
+      - vault-sync-state:/state
+    command: ["ob", "sync", "--path", "/vaults/user-1", "--continuous"]
+
 volumes:
   db-data:
+  vault-data:
+  vault-sync-state:
   caddy-data:
   caddy-config:

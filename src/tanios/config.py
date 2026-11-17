@@ -7,8 +7,10 @@ from a local .env file, which git ignores.
 
 from decimal import Decimal
 from functools import lru_cache
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -52,12 +54,30 @@ class Settings(BaseSettings):
     # W1: say "working on it" when an answer takes longer than this. Must stay under 10.
     ack_after_seconds: float = 8.0
 
+    # Memory (M1). The folder that holds one Obsidian vault per user, as user-1, user-2
+    # and so on. Left unset, memory is off and Tanios says so when asked to remember.
+    vaults_dir: Path | None = None
+    # Dates in note names and the daily log use this time zone, for example Asia/Amman.
+    timezone: str = "UTC"
+
     @field_validator("*", mode="before")
     @classmethod
-    def blank_means_unset(cls, value: object) -> object:
+    def blank_means_unset(cls, value: object, info: ValidationInfo) -> object:
         """A line like TANIOS_OWNER_NUMBER= in .env means "not set", not an empty value."""
         if isinstance(value, str) and not value.strip():
-            return None
+            # Not set means the setting's own default, which is None for the secrets.
+            return cls.model_fields[info.field_name].get_default(call_default_factory=True)
+        return value
+
+    @field_validator("timezone")
+    @classmethod
+    def timezone_must_exist(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError(
+                "TANIOS_TIMEZONE must be a time zone name such as Asia/Amman or UTC"
+            ) from None
         return value
 
     def missing_for_messaging(self) -> list[str]:

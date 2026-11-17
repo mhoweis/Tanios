@@ -18,6 +18,8 @@ Some details worth knowing:
   the full answer follows as text.
 - **Spoken commands work.** Say "status" or "pause" and Tanios acts on it. The reply
   to a command is text, because it is a list or figures.
+- **Spoken notes work.** Start with "remember ..." or "make a note to ..." and Tanios
+  saves it and confirms with a voice note. See [MEMORY.md](MEMORY.md).
 - **If the voice reply fails,** the answer still arrives as text.
 - **Recordings over five minutes** are cut at five minutes.
 - **English only** for now, as in the rest of version 1.
