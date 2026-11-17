@@ -5,10 +5,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from tanios.audio import AudioError
 from tanios.catalog import Catalog, Provider, parse_catalog
 from tanios.llm import ModelError, ModelReply
 from tanios.router import Router
+from tanios.speech import Transcript
 from tanios.store import UsageEntry, UsageSummary, User, normalize_phone
+from tanios.whatsapp.client import WhatsAppSendError
 from tanios.whatsapp.parsing import InboundMessage
 
 
@@ -128,13 +131,75 @@ class SentMessage:
 class FakeWhatsApp:
     def __init__(self) -> None:
         self.sent: list[SentMessage] = []
+        self.voices: list[tuple[str | None, bytes]] = []
+        self.media: dict[str, bytes] = {}
+        self.downloads: list[str] = []
+        self.voice_fails = False
 
     async def send_text(self, *, phone: str | None, wa_user_id: str | None, body: str) -> None:
         self.sent.append(SentMessage(phone, wa_user_id, body))
 
+    async def download_media(self, media_id: str) -> bytes:
+        self.downloads.append(media_id)
+        if media_id not in self.media:
+            raise WhatsAppSendError("HTTP 404")
+        return self.media[media_id]
+
+    async def send_voice(self, *, phone: str | None, wa_user_id: str | None, ogg: bytes) -> None:
+        if self.voice_fails:
+            raise WhatsAppSendError("HTTP 500")
+        self.voices.append((phone or wa_user_id, ogg))
+
     @property
     def bodies(self) -> list[str]:
         return [message.body for message in self.sent]
+
+
+@dataclass
+class FakeSpeech:
+    """Stands in for speech models. The "audio" it returns is readable text in bytes."""
+
+    hears: str = "what is the capital of Jordan"
+    transcribe_cost: Decimal | None = Decimal("0.0003")
+    transcribe_fails: bool = False
+    speak_fails: bool = False
+    delay_seconds: float = 0.0
+    transcriptions: list[dict] = field(default_factory=list)
+    spoken: list[dict] = field(default_factory=list)
+
+    async def transcribe(self, *, provider, api_key, model, audio, audio_format, language):
+        self.transcriptions.append(
+            {"model": model, "audio": audio, "format": audio_format, "language": language}
+        )
+        if self.delay_seconds:
+            await asyncio.sleep(self.delay_seconds)
+        if self.transcribe_fails:
+            raise ModelError("HTTP 500")
+        return Transcript(text=self.hears, cost_usd=self.transcribe_cost)
+
+    async def speak(self, *, provider, api_key, model, voice, text, audio_format):
+        self.spoken.append({"model": model, "voice": voice, "text": text, "format": audio_format})
+        if self.speak_fails:
+            raise ModelError("HTTP 500")
+        return f"{audio_format}:{text}".encode()
+
+
+class FakeConverter:
+    """Marks what it was given instead of converting, so tests can follow the audio."""
+
+    def __init__(self, fails: bool = False) -> None:
+        self.fails = fails
+
+    async def to_wav(self, audio: bytes) -> bytes:
+        if self.fails:
+            raise AudioError("ffmpeg could not convert the audio")
+        # 44 header bytes and two seconds of 16 kHz mono audio, so wav_seconds() says 2.0.
+        return b"WAV:" + audio.ljust(40 + 64000, b"\0")
+
+    async def to_voice_note(self, audio: bytes, audio_format: str) -> bytes:
+        if self.fails:
+            raise AudioError("ffmpeg could not convert the audio")
+        return b"OGG:" + audio
 
 
 # A small catalog with every tier, two providers, and one free model.
@@ -154,6 +219,25 @@ TEST_CATALOG: Catalog = parse_catalog(
             "top": [{"provider": "openrouter", "model": "top-model"}],
         },
         "tasks": {"chat": "small", "sort": "free", "draft": "medium", "plan": "top"},
+        "speech": {
+            "transcribe": [
+                {
+                    "provider": "openrouter",
+                    "model": "listen-model",
+                    "language": "en",
+                    "price_per_minute": 0.06,
+                }
+            ],
+            "speak": [
+                {
+                    "provider": "openrouter",
+                    "model": "voice-model",
+                    "voice": "alloy",
+                    "format": "mp3",
+                    "price_per_million_chars": 1000,
+                }
+            ],
+        },
     }
 )
 
@@ -192,7 +276,13 @@ class FakeGateway:
         max_tokens: int,
     ) -> ModelReply:
         self.calls.append(
-            {"provider": provider.name, "api_key": api_key, "model": model, "user": user}
+            {
+                "provider": provider.name,
+                "api_key": api_key,
+                "model": model,
+                "user": user,
+                "system": system,
+            }
         )
         if self.delay_seconds:
             await asyncio.sleep(self.delay_seconds)
@@ -216,12 +306,14 @@ def make_router(
     catalog: Catalog = TEST_CATALOG,
     keys: dict[str, str] | None = None,
     now: datetime = NOW,
+    speech: FakeSpeech | None = None,
 ) -> Router:
     return Router(
         catalog,
         {"openrouter": "sk-or-test"} if keys is None else keys,
         gateway,
         store,
+        speech=speech,
         now=lambda: now,
     )
 
@@ -255,6 +347,24 @@ def text_message(
     )
 
 
+def voice_message(
+    media_id: str = "MEDIA1",
+    *,
+    sender: str | None = OWNER,
+    message_id: str = "wamid.v1",
+    wa_user_id: str | None = None,
+) -> InboundMessage:
+    return InboundMessage(
+        id=message_id,
+        kind="audio",
+        text=None,
+        phone=sender,
+        wa_user_id=wa_user_id,
+        phone_number_id="1234567890",
+        media_id=media_id,
+    )
+
+
 def webhook_payload(
     body: str = "Hi!",
     *,
@@ -272,6 +382,13 @@ def webhook_payload(
         message["from_user_id"] = wa_user_id
     if kind == "text":
         message["text"] = {"body": body}
+    if kind == "audio":
+        message["audio"] = {
+            "mime_type": "audio/ogg; codecs=opus",
+            "sha256": "wvqXMe6n7n1W0zphvLPoLj+s/NtKqmr3zZ7YzTP7xFI=",
+            "id": "1908647269898587",
+            "voice": True,
+        }
     return {
         "object": "whatsapp_business_account",
         "entry": [

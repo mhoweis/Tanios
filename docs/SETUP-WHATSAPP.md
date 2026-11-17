@@ -146,6 +146,5 @@ When all six pass, milestone 1 is done. The checks for milestone 2 are at the en
 
 - Tanios does not remember earlier messages yet. Each question is answered alone.
   Memory arrives in milestone 4.
-- Voice notes get a short "text only for now" reply until milestone 3.
 - Meta's test number is for trying things out. Moving to a number of your own is a
   later step and comes with its own guide.

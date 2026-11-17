@@ -6,7 +6,10 @@ ever read as an instruction or shown to a model (W3).
 
 import asyncio
 import logging
+import re
+from collections.abc import Awaitable
 
+from tanios.audio import AudioConverter, AudioError, wav_seconds
 from tanios.llm import ModelError
 from tanios.router import CHAT, BudgetExceeded, Router, money
 from tanios.store import Store, UsageSummary, User
@@ -16,7 +19,10 @@ from tanios.whatsapp.parsing import InboundMessage
 logger = logging.getLogger(__name__)
 
 STRANGER_REPLY = "This is a private assistant. It only answers its registered users."
-UNSUPPORTED_REPLY = "I can only read text messages for now."
+UNSUPPORTED_REPLY = "I can only read text messages and voice notes for now."
+VOICE_OFF_REPLY = "Voice notes are not set up on this server yet. Please send text."
+VOICE_FAILED_REPLY = "Sorry, I could not process that voice note. Please try again or send text."
+VOICE_EMPTY_REPLY = "I could not make out any words in that voice note."
 WORKING_REPLY = "Working on it..."
 APOLOGY_REPLY = "Sorry, I could not get an answer just now. Please try again in a minute."
 PAUSED_REPLY = "Tanios is paused. Send resume to start again."
@@ -38,16 +44,42 @@ FORGET_REPLY = "There is nothing to forget yet: memory is not switched on."
 
 # Message kinds a person sends on purpose and would expect an answer to. Reactions,
 # read receipts and system notices are ignored silently.
-UNSUPPORTED_KINDS = {"audio", "image", "video", "document", "sticker", "location", "contacts"}
+UNSUPPORTED_KINDS = {"image", "video", "document", "sticker", "location", "contacts"}
+
+# A spoken reply longer than this is cut at a sentence, and the full text is sent too.
+# About 90 seconds of speech, which also keeps the file small enough for WhatsApp to show
+# the play button.
+MAX_SPOKEN_CHARS = 1200
 
 SYSTEM_PROMPT = (
     "You are Tanios, a personal assistant the user talks to on WhatsApp. "
     "Answer in plain text suited to a phone: short and direct, with no markdown headings "
-    "or tables. Today you can only chat and answer questions. Handling email, remembering "
-    "things between messages, saving files and understanding voice notes are still being "
+    "or tables. Today you can only chat and answer questions, by text or voice note. "
+    "Handling email, remembering things between messages and saving files are still being "
     "built. If the user asks for one of those, say plainly that it is not available yet. "
     "Never claim to have sent, saved, scheduled or remembered anything."
 )
+
+VOICE_SYSTEM_PROMPT = (
+    SYSTEM_PROMPT + " The user sent a voice note and your reply will be read aloud. Use plain "
+    "spoken sentences with no lists, symbols or emoji, and keep it under 90 words unless "
+    "asked for more."
+)
+
+_TO_COPY = re.compile(r"https?://|www\.|\S+@\S+\.\S+|\d{5,}")
+
+
+def needs_text_copy(answer: str) -> bool:
+    """W2: is there something in this answer the user will want to copy, not just hear?"""
+    return bool(_TO_COPY.search(answer)) or answer.count("\n") >= 2
+
+
+def spoken_part(answer: str, limit: int = MAX_SPOKEN_CHARS) -> str:
+    """The answer, or its opening sentences when it is too long to read aloud."""
+    if len(answer) <= limit:
+        return answer
+    cut = max(answer.rfind(mark, 0, limit) for mark in (". ", "! ", "? ", "\n"))
+    return answer[: cut + 1].strip() if cut > limit // 3 else answer[:limit].strip()
 
 
 def format_status(user: User, month: str, usage: UsageSummary, key_names: list[str]) -> str:
@@ -78,7 +110,8 @@ def format_status(user: User, month: str, usage: UsageSummary, key_names: list[s
 
 def parse_command(text: str) -> str | None:
     """The command a message is, or None when it is an ordinary question (W4)."""
-    words = text.strip().lower().split()
+    # A transcribed voice note arrives as "Status." or "Pause!".
+    words = text.strip().strip(".!?,").lower().split()
     if not words:
         return None
     if len(words) == 1 and words[0] in {"help", "status", "pause", "resume", "forget"}:
@@ -95,8 +128,10 @@ class Assistant:
         whatsapp: WhatsAppClient,
         router: Router,
         *,
+        audio: AudioConverter | None = None,
         ack_after_seconds: float = 8.0,
     ) -> None:
+        self._audio = audio
         self._store = store
         self._whatsapp = whatsapp
         self._router = router
@@ -120,6 +155,9 @@ class Assistant:
                 await self._reply(message, STRANGER_REPLY)
             return
 
+        if message.kind == "audio" and message.media_id:
+            await self._voice_note(user, message)
+            return
         if message.kind != "text" or not message.text or not message.text.strip():
             if message.kind in UNSUPPORTED_KINDS:
                 await self._reply(message, UNSUPPORTED_REPLY)
@@ -150,16 +188,13 @@ class Assistant:
             await self._reply(message, FORGET_REPLY)
 
     async def _answer(self, user: User, message: InboundMessage) -> None:
-        answer = asyncio.create_task(
-            self._router.complete(
-                user=user, task=CHAT, system=SYSTEM_PROMPT, prompt=message.text.strip()
-            )
-        )
-        finished, _ = await asyncio.wait({answer}, timeout=self._ack_after_seconds)
-        if not finished:
-            await self._reply(message, WORKING_REPLY)  # W1: within 10 seconds
         try:
-            reply = await answer
+            reply = await self._with_ack(
+                message,
+                self._router.complete(
+                    user=user, task=CHAT, system=SYSTEM_PROMPT, prompt=message.text.strip()
+                ),
+            )
         except BudgetExceeded as stop:
             await self._reply(message, str(stop))  # R4: say what still works
             return
@@ -170,6 +205,87 @@ class Assistant:
         await self._reply(message, reply.text)
         if reply.notice:
             await self._reply(message, reply.notice)
+
+    async def _with_ack(self, message: InboundMessage, work: Awaitable):
+        """Run slow work, saying "Working on it..." if it is still going after a while (W1)."""
+        task = asyncio.ensure_future(work)
+        finished, _ = await asyncio.wait({task}, timeout=self._ack_after_seconds)
+        if not finished:
+            await self._reply(message, WORKING_REPLY)
+        return await task
+
+    # Voice notes (W2) -----------------------------------------------------------------
+
+    async def _voice_note(self, user: User, message: InboundMessage) -> None:
+        if self._audio is None or not self._router.voice_ready():
+            await self._reply(message, VOICE_OFF_REPLY)
+            return
+        if user.paused:
+            await self._reply(message, PAUSED_REPLY)
+            return
+        try:
+            heard = await self._with_ack(message, self._hear(user, message))
+        except BudgetExceeded as stop:
+            await self._reply(message, str(stop))
+            return
+        except (ModelError, AudioError, WhatsAppSendError) as error:
+            logger.warning("voice note not understood: %s", error)
+            await self._reply(message, VOICE_FAILED_REPLY)
+            return
+        if not heard.strip():
+            await self._reply(message, VOICE_EMPTY_REPLY)
+            return
+
+        # A spoken command works like a typed one, and is answered in text: its reply is
+        # a list or figures, which are for reading.
+        command = parse_command(heard)
+        if command is not None:
+            await self._run_command(command, user, message)
+            return
+
+        try:
+            reply = await self._with_ack(
+                message,
+                self._router.complete(
+                    user=user, task=CHAT, system=VOICE_SYSTEM_PROMPT, prompt=heard.strip()
+                ),
+            )
+        except BudgetExceeded as stop:
+            await self._reply(message, str(stop))
+            return
+        except ModelError as error:
+            logger.warning("no answer: %s", error)
+            await self._reply(message, APOLOGY_REPLY)
+            return
+
+        to_speak = spoken_part(reply.text)
+        spoken = await self._say(user, message, to_speak)
+        # Text as well when the voice reply failed, was cut short, or holds something to copy.
+        if not spoken or to_speak != reply.text or needs_text_copy(reply.text):
+            await self._reply(message, reply.text)
+        if reply.notice:
+            await self._reply(message, reply.notice)
+
+    async def _hear(self, user: User, message: InboundMessage) -> str:
+        """Download a voice note and turn it into text."""
+        recording = await self._whatsapp.download_media(message.media_id)
+        wav = await self._audio.to_wav(recording)
+        return await self._router.transcribe(
+            user=user, audio=wav, audio_format="wav", seconds=wav_seconds(wav)
+        )
+
+    async def _say(self, user: User, message: InboundMessage, text: str) -> bool:
+        """Send text as a voice note. False when it could not be done; the caller sends text."""
+        try:
+            speech = await self._router.speak(user=user, text=text)
+            ogg = await self._audio.to_voice_note(speech.data, speech.format)
+            await self._whatsapp.send_voice(
+                phone=message.phone, wa_user_id=message.wa_user_id, ogg=ogg
+            )
+        except (BudgetExceeded, ModelError, AudioError, WhatsAppSendError) as error:
+            logger.warning("voice reply not sent, falling back to text: %s", type(error).__name__)
+            return False
+        return True
 
     async def _reply(self, message: InboundMessage, body: str) -> None:
         try:

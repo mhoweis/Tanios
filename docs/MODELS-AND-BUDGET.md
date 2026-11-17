@@ -31,7 +31,7 @@ What happens as you spend:
 | Under 80% of the cap | Nothing. Send `status` any time to see where you are. |
 | 80% | One message: `Heads up: you have used $4.10 of your $5.00 monthly cap (82%).` |
 | 100% | One message saying the cap is reached. Paid models stay off until the 1st of next month. |
-| After that | Commands still work. Ordinary questions are answered by a free model, which is less capable. |
+| After that | Commands still work. Typed questions are answered by a free model, which is less capable. Voice notes are off. |
 
 Three things to know:
 
@@ -69,6 +69,9 @@ As shipped, every model is reached through OpenRouter:
 | top | Claude Opus (latest) | The retry for a failed medium answer, and later long, multi-step jobs |
 
 These were checked on openrouter.ai on 15 November 2026. Prices and model names change.
+
+The same file also names the two speech models used for voice notes. See
+[VOICE-NOTES.md](VOICE-NOTES.md).
 
 ### Change a model
 

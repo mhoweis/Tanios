@@ -14,6 +14,8 @@ uv run ruff format .             # format
 uv run uvicorn tanios.main:create_app --factory --reload   # run locally
 ```
 
+The voice-note tests convert real audio and are skipped when `ffmpeg` is not installed.
+
 Set `TANIOS_TEST_DATABASE_URL` to also run the tests that need a real Postgres. Those
 tests empty the tables, so point it at a throwaway database.
 
@@ -43,7 +45,7 @@ The server applies migrations at start with `python -m tanios.migrate`.
 - Model names and prices live in `config/models.toml`, not in code.
 - Every model call goes through `tanios.router.Router.complete`. Nothing else may call a
   model. A task that handles email, vault or file content is created with
-  `Task(name, private=True)`.
+  `Task(name, private=True)`. Speech goes through `Router.transcribe` and `Router.speak`.
 - Never weaken a test or a lint rule to get to green.
 
 ## The owner

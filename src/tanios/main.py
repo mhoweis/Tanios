@@ -16,11 +16,13 @@ from fastapi.responses import PlainTextResponse
 
 from tanios import __version__
 from tanios.assistant import Assistant
+from tanios.audio import FfmpegConverter
 from tanios.catalog import CatalogError, load_catalog, resolve_path
 from tanios.config import Settings, get_settings
 from tanios.db import Database, DatabaseLike
 from tanios.llm import ChatCompletionsGateway
 from tanios.router import CHAT, Router
+from tanios.speech import AudioApiGateway
 from tanios.store import SqlStore
 from tanios.whatsapp.client import CloudApiClient
 from tanios.whatsapp.parsing import InboundMessage, parse_webhook
@@ -161,6 +163,7 @@ async def _build_assistant(
         settings.provider_keys(),
         ChatCompletionsGateway(http),
         store,
+        speech=AudioApiGateway(http),
         max_tokens=settings.max_reply_tokens,
     )
     if not router.can_answer(CHAT):
@@ -178,4 +181,12 @@ async def _build_assistant(
         api_base=settings.whatsapp_api_base,
         graph_version=settings.whatsapp_graph_version,
     )
-    return Assistant(store, whatsapp, router, ack_after_seconds=settings.ack_after_seconds)
+    if not router.voice_ready():
+        logger.warning("voice notes are off: no speech model can be reached")
+    return Assistant(
+        store,
+        whatsapp,
+        router,
+        audio=FfmpegConverter(),
+        ack_after_seconds=settings.ack_after_seconds,
+    )

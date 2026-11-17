@@ -100,10 +100,10 @@ def test_w1_the_same_message_delivered_twice_is_answered_once():
     assert len(world.model.prompts) == 1
 
 
-def test_w1_a_voice_note_gets_a_clear_reply_until_voice_is_built():
+def test_w1_a_photo_gets_a_clear_reply_that_only_text_and_voice_work():
     world = World()
 
-    world.receive(replace(text_message(""), kind="audio", text=None))
+    world.receive(replace(text_message(""), kind="image", text=None, media_id="IMG1"))
 
     assert world.whatsapp.bodies == [replies.UNSUPPORTED_REPLY]
     assert world.model.prompts == []
