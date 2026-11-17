@@ -56,7 +56,7 @@ nano .env
 ```
 
 Set `TANIOS_DOMAIN` to your web address and `POSTGRES_PASSWORD` to the password that
-was just printed. Save with Ctrl+O, Enter, then exit with Ctrl+X.
+was just printed. Leave the WhatsApp and model lines empty for now. Save with Ctrl+O, Enter, then exit with Ctrl+X.
 
 The `.env` file holds secrets. It stays on the server and is never committed.
 
@@ -69,9 +69,10 @@ docker compose up -d --build
 The first start takes a few minutes. Then check, from any browser or phone:
 
 - `https://YOUR_DOMAIN/healthz` should show `{"status":"ok","version":"..."}`
-- `https://YOUR_DOMAIN/readyz` should show `{"status":"ready","database":"ok"}`
+- `https://YOUR_DOMAIN/readyz` should start with `{"status":"ready","database":"ok"`
 
-When both answer, milestone 0 is done.
+When both answer, milestone 0 is done. `/readyz` also shows `"whatsapp":"off"` until you
+follow [SETUP-WHATSAPP.md](SETUP-WHATSAPP.md).
 
 ## Updating later
 

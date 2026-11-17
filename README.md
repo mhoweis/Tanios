@@ -7,6 +7,7 @@ model that can do each job.
 - What it must do: [docs/SPEC.md](docs/SPEC.md)
 - Where the build stands: [docs/STATUS.md](docs/STATUS.md)
 - How to put it on a server: [docs/DEPLOY.md](docs/DEPLOY.md)
+- How to connect WhatsApp and a model: [docs/SETUP-WHATSAPP.md](docs/SETUP-WHATSAPP.md)
 
 ## Run it on your own computer
 
@@ -18,7 +19,8 @@ uv run uvicorn tanios.main:create_app --factory --reload
 ```
 
 Then open http://127.0.0.1:8000/healthz. Without a database configured, `/healthz`
-answers `ok` and `/readyz` answers `not ready`; that is expected.
+answers `ok` and `/readyz` answers `not ready`; that is expected. WhatsApp chat stays
+off until every setting in `.env.example` is filled in.
 
 ## Check the code
 

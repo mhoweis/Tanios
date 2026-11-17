@@ -14,7 +14,11 @@ uv run ruff format .             # format
 uv run uvicorn tanios.main:create_app --factory --reload   # run locally
 ```
 
-Set `TANIOS_TEST_DATABASE_URL` to also run the test that needs a real Postgres.
+Set `TANIOS_TEST_DATABASE_URL` to also run the tests that need a real Postgres. Those
+tests empty the tables, so point it at a throwaway database.
+
+Changing `src/tanios/tables.py` needs a new file in `src/tanios/migrations/versions/`.
+The server applies migrations at start with `python -m tanios.migrate`.
 
 ## How work lands
 

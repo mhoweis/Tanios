@@ -22,7 +22,6 @@ USER tanios
 EXPOSE 8000
 
 # Port 8000 is reachable only from the Caddy container (see docker-compose.yml), so the
-# forwarded headers it sets can be trusted.
-CMD ["/app/.venv/bin/uvicorn", "tanios.main:create_app", "--factory", \
-     "--host", "0.0.0.0", "--port", "8000", \
-     "--proxy-headers", "--forwarded-allow-ips", "*"]
+# forwarded headers it sets can be trusted. Database tables are brought up to date
+# before the app starts.
+CMD ["sh", "-c", "/app/.venv/bin/python -m tanios.migrate && exec /app/.venv/bin/uvicorn tanios.main:create_app --factory --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips '*'"]

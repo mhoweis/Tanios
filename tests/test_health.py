@@ -44,7 +44,7 @@ def test_readyz_is_ready_when_the_database_answers():
         response = client.get("/readyz")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ready", "database": "ok"}
+    assert response.json() == {"status": "ready", "database": "ok", "whatsapp": "off"}
 
 
 def test_readyz_is_not_ready_when_the_database_is_down():
@@ -52,7 +52,7 @@ def test_readyz_is_not_ready_when_the_database_is_down():
         response = client.get("/readyz")
 
     assert response.status_code == 503
-    assert response.json() == {"status": "not ready", "database": "down"}
+    assert response.json() == {"status": "not ready", "database": "down", "whatsapp": "off"}
 
 
 def test_readyz_is_not_ready_when_no_database_is_configured():
@@ -60,7 +60,11 @@ def test_readyz_is_not_ready_when_no_database_is_configured():
         response = client.get("/readyz")
 
     assert response.status_code == 503
-    assert response.json() == {"status": "not ready", "database": "not configured"}
+    assert response.json() == {
+        "status": "not ready",
+        "database": "not configured",
+        "whatsapp": "off",
+    }
 
 
 def test_the_database_is_closed_when_the_server_stops():

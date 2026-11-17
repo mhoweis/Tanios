@@ -1,14 +1,15 @@
-"""Database connection.
-
-Milestone 0 only needs to prove the server can reach Postgres. Tables arrive with the
-milestones that use them.
-"""
+"""Database connection."""
 
 import logging
 from typing import Protocol
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,9 @@ class DatabaseLike(Protocol):
 class Database:
     def __init__(self, url: str) -> None:
         self._engine: AsyncEngine = create_async_engine(url, pool_pre_ping=True)
+        self.sessions: async_sessionmaker[AsyncSession] = async_sessionmaker(
+            self._engine, expire_on_commit=False
+        )
 
     async def ping(self) -> bool:
         """True when a trivial query succeeds. Never raises."""
